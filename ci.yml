@@ -1,0 +1,86 @@
+name: "Thesis CI Pipeline"
+
+# Runs on every push and every pull request
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+
+  # ── Job 1: Lint ────────────────────────────────────────────────────────────
+  lint:
+    name: "Lint (flake8)"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install flake8
+        run: pip install flake8==6.1.0
+
+      - name: Run flake8
+        run: flake8 src/ tests/ --statistics
+
+  # ── Job 2: Install deps + run tests ───────────────────────────────────────
+  test:
+    name: "Unit Tests (pytest)"
+    runs-on: ubuntu-latest
+    needs: lint          # only runs if lint passes
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip          # caches pip packages between runs
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: pytest
+
+      - name: Upload test results
+        if: always()          # upload even if tests fail
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-results
+          path: .pytest_cache/
+
+  # ── Job 3: Architecture check ──────────────────────────────────────────────
+  architecture:
+    name: "Architecture Check (circular imports)"
+    runs-on: ubuntu-latest
+    needs: lint
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Check for circular imports
+        run: |
+          python -c "
+          from src.services.user import UserService
+          from src.services.order import OrderService
+          print('✅ No circular imports detected')
+          print(f'   UserService: {UserService}')
+          print(f'   OrderService: {OrderService}')
+          "
