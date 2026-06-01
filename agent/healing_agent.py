@@ -1,15 +1,12 @@
 """
-Self-Healing CI Agent
+Self-Healing CI Agent — v2 (bugfixed)
 Bachelor Thesis — Valentin Jurke
 
-Flow per scenario:
-  1. Create a new Git branch
-  2. Inject broken scenario file(s) via GitHub API
-  3. Wait for CI to fail → read logs
-  4. Call local Ollama to generate a fix
-  5. Apply fix via GitHub API → push
-  6. Wait for CI to turn green
-  7. Record metrics
+Fixes vs v1:
+  FIX 1 (functional)  : Prompt verlangt jetzt vollständige Funktion als Snippet → eindeutig
+  FIX 2 (syntactic)   : Whitespace-normalisiertes Snippet-Matching
+  FIX 3 (architectural): context_files zeigt LLM was in src/data.py existiert;
+                         Prompt fordert Fixes für ALLE betroffenen Dateien
 """
 
 import base64
@@ -22,29 +19,30 @@ from typing import Optional
 
 import requests
 
-# ── Configuration — edit these ────────────────────────────────────────────────
+# ── Configuration ─────────────────────────────────────────────────────────────
 
-GITHUB_TOKEN  = os.environ.get("GITHUB_TOKEN", "")   # set via env var
-GITHUB_OWNER  = "Seraph-V"                        # e.g. "Seraph-V"
+GITHUB_TOKEN  = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_OWNER  = "Seraph-V"
 GITHUB_REPO   = "selfHealing"
 BASE_BRANCH   = "main"
 
 OLLAMA_URL    = "http://localhost:11434"
-OLLAMA_MODEL  = "codellama:7b"          # change to :13b when ready
+OLLAMA_MODEL  = "codellama:7b"
 OLLAMA_TEMP   = 0.2
 
-MAX_ATTEMPTS  = 3     # LLM fix attempts per scenario run
-CI_POLL_SEC   = 15    # seconds between CI status checks
-CI_TIMEOUT    = 300   # max seconds to wait for CI result
+MAX_ATTEMPTS  = 3
+CI_POLL_SEC   = 15
+CI_TIMEOUT    = 300
 
 # ── Data classes ──────────────────────────────────────────────────────────────
 
 @dataclass
 class Scenario:
     id: str
-    failure_type: str          # functional | syntactic | configurational | architectural
+    failure_type: str
     description: str
-    broken_files: dict[str, str]   # repo_path → local scenario file path
+    broken_files: dict[str, str]       # repo_path → local broken file
+    context_files: list[str] = field(default_factory=list)  # FIX 3: extra read-only context
 
 
 @dataclass
@@ -66,7 +64,6 @@ class RunResult:
 # ── GitHub API helpers ────────────────────────────────────────────────────────
 
 def gh(method: str, path: str, **kwargs):
-    """Thin wrapper around the GitHub REST API."""
     url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}{path}"
     headers = {
         "Authorization": f"Bearer {GITHUB_TOKEN}",
@@ -80,19 +77,13 @@ def gh(method: str, path: str, **kwargs):
 
 
 def get_sha(branch: str) -> str:
-    """Get the HEAD SHA of a branch."""
-    data = gh("GET", f"/git/ref/heads/{branch}")
-    return data["object"]["sha"]
+    return gh("GET", f"/git/ref/heads/{branch}")["object"]["sha"]
 
 
 def create_branch(branch_name: str) -> str:
-    """Create a new branch from BASE_BRANCH. Returns branch name."""
     sha = get_sha(BASE_BRANCH)
     try:
-        gh("POST", "/git/refs", json={
-            "ref": f"refs/heads/{branch_name}",
-            "sha": sha,
-        })
+        gh("POST", "/git/refs", json={"ref": f"refs/heads/{branch_name}", "sha": sha})
         print(f"  ✓ Branch created: {branch_name}")
     except RuntimeError as e:
         if "already exists" in str(e):
@@ -103,72 +94,49 @@ def create_branch(branch_name: str) -> str:
 
 
 def delete_branch(branch_name: str):
-    """Delete a branch (cleanup after experiment)."""
     try:
         gh("DELETE", f"/git/refs/heads/{branch_name}")
     except RuntimeError:
-        pass  # ignore if already deleted
+        pass
 
 
 def get_file_sha(path: str, branch: str) -> Optional[str]:
-    """Get the blob SHA of a file on a branch (needed for updates)."""
     try:
-        data = gh("GET", f"/contents/{path}", params={"ref": branch})
-        return data["sha"]
+        return gh("GET", f"/contents/{path}", params={"ref": branch})["sha"]
     except RuntimeError:
         return None
 
 
 def push_file(repo_path: str, content: str, message: str, branch: str):
-    """Create or update a file on a branch."""
     encoded = base64.b64encode(content.encode()).decode()
     file_sha = get_file_sha(repo_path, branch)
-    payload = {
-        "message": message,
-        "content": encoded,
-        "branch": branch,
-    }
+    payload = {"message": message, "content": encoded, "branch": branch}
     if file_sha:
         payload["sha"] = file_sha
     gh("PUT", f"/contents/{repo_path}", json=payload)
 
 
 def get_file_content(repo_path: str, branch: str) -> str:
-    """Download a file's content from a branch."""
     data = gh("GET", f"/contents/{repo_path}", params={"ref": branch})
     return base64.b64decode(data["content"]).decode()
 
 
-def wait_for_ci(branch: str, commit_sha: str = None) -> tuple[str, str]:
-    """
-    Poll until the CI run on `branch` completes.
-    Returns (conclusion, logs_text) where conclusion is 'success' | 'failure' | 'timeout'.
-    """
-    print(f"  ⏳ Waiting for CI on branch '{branch}'...", end="", flush=True)
+def wait_for_ci(branch: str) -> tuple[str, str]:
+    print(f"  ⏳ Waiting for CI on '{branch}'...", end="", flush=True)
     deadline = time.time() + CI_TIMEOUT
-    last_run_id = None
+    seen_run_id = None
 
     while time.time() < deadline:
         time.sleep(CI_POLL_SEC)
-        runs = gh("GET", "/actions/runs", params={
-            "branch": branch,
-            "per_page": 5,
-        }).get("workflow_runs", [])
-
+        runs = gh("GET", "/actions/runs", params={"branch": branch, "per_page": 5}).get("workflow_runs", [])
         if not runs:
             print(".", end="", flush=True)
             continue
 
-        run = runs[0]  # most recent
-        last_run_id = run["id"]
-        status     = run["status"]      # queued | in_progress | completed
-        conclusion = run["conclusion"]  # success | failure | None
-
-        if status == "completed":
-            print(f" {conclusion}")
-            logs = fetch_ci_logs(last_run_id)
-            return conclusion, logs
-
+        run = runs[0]
+        if run["status"] == "completed":
+            print(f" {run['conclusion']}")
+            return run["conclusion"], fetch_ci_logs(run["id"])
         print(".", end="", flush=True)
 
     print(" TIMEOUT")
@@ -176,24 +144,21 @@ def wait_for_ci(branch: str, commit_sha: str = None) -> tuple[str, str]:
 
 
 def fetch_ci_logs(run_id: int) -> str:
-    """Fetch and return the combined log text of all jobs in a run."""
     jobs = gh("GET", f"/actions/runs/{run_id}/jobs").get("jobs", [])
-    log_parts = []
+    parts = []
     for job in jobs:
-        log_parts.append(f"=== JOB: {job['name']} [{job['conclusion']}] ===")
+        parts.append(f"=== JOB: {job['name']} [{job['conclusion']}] ===")
         for step in job.get("steps", []):
             if step.get("conclusion") == "failure":
-                log_parts.append(f"  FAILED STEP: {step['name']}")
-    # Full logs need a separate endpoint (returns zip — simplified here)
-    return "\n".join(log_parts)
+                parts.append(f"  FAILED STEP: {step['name']}")
+    return "\n".join(parts)
 
 
 # ── Ollama helpers ────────────────────────────────────────────────────────────
 
 def ollama_available() -> bool:
     try:
-        r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=5)
-        return r.status_code == 200
+        return requests.get(f"{OLLAMA_URL}/api/tags", timeout=5).status_code == 200
     except Exception:
         return False
 
@@ -201,25 +166,47 @@ def ollama_available() -> bool:
 def ollama_generate(prompt: str) -> str:
     resp = requests.post(
         f"{OLLAMA_URL}/api/generate",
-        json={
-            "model": OLLAMA_MODEL,
-            "prompt": prompt,
-            "stream": False,
-            "options": {"temperature": OLLAMA_TEMP, "num_predict": 2048},
-        },
-        timeout=120,
+        json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False,
+              "options": {"temperature": OLLAMA_TEMP, "num_predict": 2048}},
+        timeout=180,
     )
     resp.raise_for_status()
     return resp.json().get("response", "")
 
 
-def build_prompt(failure_type: str, ci_logs: str, broken_files: dict[str, str]) -> str:
+# ── FIX 1 + FIX 3: Verbesserter Prompt ───────────────────────────────────────
+
+def build_prompt(failure_type: str, ci_logs: str,
+                 broken_files: dict[str, str],
+                 context_files: dict[str, str] = None) -> str:
+
+    # Broken files block
     files_block = "\n\n".join(
-        f"### FILE: {path}\n```python\n{content}\n```"
+        f"### FILE TO FIX: {path}\n```python\n{content}\n```"
         for path, content in broken_files.items()
     )
-    return f"""You are an expert DevOps engineer. A CI/CD pipeline has failed.
-Produce a minimal, correct fix. Respond ONLY with a valid JSON object — no prose, no markdown.
+
+    # FIX 3: context files block (read-only, e.g. src/data.py)
+    context_block = ""
+    if context_files:
+        context_block = "\n\nCONTEXT FILES (do NOT patch these, use them as reference):\n"
+        context_block += "\n\n".join(
+            f"### CONTEXT: {path}\n```python\n{content}\n```"
+            for path, content in context_files.items()
+        )
+
+    # FIX 1: Architectural extra instruction
+    arch_note = ""
+    if failure_type == "architectural":
+        arch_note = """
+ARCHITECTURAL NOTE:
+- Fix ALL files that contribute to the circular dependency, not just one.
+- Only import symbols that actually exist in the referenced module (check CONTEXT FILES).
+- The correct fix is to remove the cross-service import and use the shared data layer instead.
+"""
+
+    return f"""You are an expert DevOps engineer fixing a CI/CD pipeline failure.
+Respond ONLY with a valid JSON object. No prose, no markdown fences.
 
 FAILURE TYPE: {failure_type}
 
@@ -228,25 +215,55 @@ CI LOG:
 {ci_logs[:2000]}
 ---
 
-BROKEN FILES:
-{files_block}
+{files_block}{context_block}{arch_note}
 
-JSON schema to follow exactly:
+RULES FOR PATCHES:
+1. original_snippet MUST include the complete function or class block — never just a single line.
+   This guarantees the snippet is unique in the file and can be matched exactly.
+2. fixed_snippet replaces original_snippet entirely. Keep indentation consistent.
+3. Only patch FILES TO FIX listed above. Never patch CONTEXT FILES.
+4. Only reference symbols that actually exist in the codebase (check CONTEXT FILES).
+
+Respond with ONLY this JSON — no other text:
 {{
   "analysis": "<one sentence root-cause>",
   "confidence": <0.0-1.0>,
   "patches": [
     {{
-      "filename": "<exact path from above>",
-      "original_snippet": "<exact lines to replace>",
+      "filename": "<exact path>",
+      "original_snippet": "<complete function/block — must be unique in the file>",
       "fixed_snippet": "<replacement>"
     }}
   ],
   "hallucination_risk": "<low|medium|high>",
   "requires_human_review": <true|false>
-}}
+}}"""
 
-Only JSON. No other text."""
+
+# ── FIX 2: Whitespace-normalisiertes Snippet-Matching ────────────────────────
+
+def normalize_ws(text: str) -> str:
+    """Entfernt trailing whitespace pro Zeile — löst Syntactic-Mismatch."""
+    return "\n".join(line.rstrip() for line in text.split("\n"))
+
+
+def find_snippet(content: str, snippet: str) -> bool:
+    """Prüft ob snippet im content steht — mit und ohne Whitespace-Normalisierung."""
+    if snippet in content:
+        return True
+    # FIX 2: Fallback mit normalisiertem Vergleich
+    return normalize_ws(snippet) in normalize_ws(content)
+
+
+def apply_snippet(content: str, original: str, replacement: str) -> str:
+    """Ersetzt original durch replacement — normalisiert bei Bedarf."""
+    if original in content:
+        return content.replace(original, replacement, 1)
+    # FIX 2: Normalisierter Fallback
+    norm_content  = normalize_ws(content)
+    norm_original = normalize_ws(original)
+    norm_replace  = normalize_ws(replacement)
+    return norm_content.replace(norm_original, norm_replace, 1)
 
 
 def parse_patch(raw: str) -> Optional[dict]:
@@ -266,70 +283,63 @@ def parse_patch(raw: str) -> Optional[dict]:
 # ── Healing loop ──────────────────────────────────────────────────────────────
 
 def heal_scenario(scenario: Scenario, run_index: int) -> list[RunResult]:
-    """Run one scenario, up to MAX_ATTEMPTS fix attempts. Returns list of RunResult."""
     results = []
-    branch = f"experiment/{scenario.id}-run{run_index}"
+    branch  = f"experiment/{scenario.id}-run{run_index}"
     t_start = time.time()
 
     print(f"\n{'─'*60}")
     print(f"Scenario : {scenario.id}  [{scenario.failure_type}]  run={run_index}")
     print(f"Branch   : {branch}")
 
-    # 1. Create branch
     create_branch(branch)
 
-    # 2. Read healthy files from main (for context + later restoration)
-    healthy_files = {}
-    for repo_path in scenario.broken_files.keys():
-        try:
-            healthy_files[repo_path] = get_file_content(repo_path, BASE_BRANCH)
-        except Exception:
-            healthy_files[repo_path] = ""
-
-    # 3. Inject broken files
+    # Inject broken files
     for repo_path, local_path in scenario.broken_files.items():
         with open(local_path) as f:
             broken_content = f.read()
         push_file(repo_path, broken_content,
                   f"[experiment] inject {scenario.failure_type} regression", branch)
-        print(f"  ✓ Injected broken file: {repo_path}")
+        print(f"  ✓ Injected: {repo_path}")
 
-    # 4. Wait for CI to fail
+    # Wait for CI to fail
     conclusion, ci_logs = wait_for_ci(branch)
     if conclusion == "success":
-        print("  ⚠  CI passed even with broken files — check scenario definition")
-        delete_branch(branch)
+        print("  ⚠  CI passed with broken files — check scenario definition")
         return results
 
-    print(f"  ✗ CI failed as expected ({conclusion})")
+    print(f"  ✗ CI failed as expected")
 
-    # 5. Read broken file contents for LLM context
-    broken_contents = {}
+    # Read broken file contents + FIX 3: context files from main
+    broken_contents: dict[str, str] = {}
     for repo_path in scenario.broken_files.keys():
         broken_contents[repo_path] = get_file_content(repo_path, branch)
 
-    # 6. Attempt fixes
+    context_contents: dict[str, str] = {}
+    for repo_path in scenario.context_files:
+        try:
+            context_contents[repo_path] = get_file_content(repo_path, BASE_BRANCH)
+        except Exception:
+            pass
+
+    # Attempt fixes
     for attempt in range(1, MAX_ATTEMPTS + 1):
         print(f"\n  [Attempt {attempt}/{MAX_ATTEMPTS}]")
-        result = RunResult(
-            scenario_id=scenario.id,
-            attempt=attempt,
-            branch=branch,
-        )
+        result = RunResult(scenario_id=scenario.id, attempt=attempt, branch=branch)
 
         # LLM call
-        prompt = build_prompt(scenario.failure_type, ci_logs, broken_contents)
-        print("  🤖 Calling Ollama...", end="", flush=True)
+        prompt = build_prompt(
+            scenario.failure_type, ci_logs, broken_contents, context_contents
+        )
+        print("  Calling Ollama...", end="", flush=True)
         try:
             raw = ollama_generate(prompt)
             print(" done")
         except Exception as e:
             result.error = f"Ollama error: {e}"
-            print(f" ERROR: {e}")
             results.append(result)
             break
 
-        result.llm_raw = raw
+        result.llm_raw        = raw
         result.patch_generated = bool(raw.strip())
 
         patch_data = parse_patch(raw)
@@ -339,8 +349,7 @@ def heal_scenario(scenario: Scenario, run_index: int) -> list[RunResult]:
             results.append(result)
             continue
 
-        print(f"  → Analysis : {patch_data.get('analysis', 'N/A')}")
-        print(f"  → Confidence: {patch_data.get('confidence', '?')}")
+        print(f"  → {patch_data.get('analysis', 'N/A')}  (confidence={patch_data.get('confidence','?')})")
 
         # Hallucination check
         known = set(scenario.broken_files.keys())
@@ -348,32 +357,35 @@ def heal_scenario(scenario: Scenario, run_index: int) -> list[RunResult]:
             if p.get("filename") not in known:
                 result.hallucination = True
                 result.error = f"Hallucination: unknown file '{p.get('filename')}'"
-                print(f"  ⚠  Hallucination detected: {result.error}")
+                print(f"  ⚠  {result.error}")
                 break
 
         if result.hallucination:
             results.append(result)
             continue
 
-        # Apply patches via GitHub API
+        # Apply patches (FIX 1 + FIX 2)
         diff_lines = []
-        apply_ok = True
+        apply_ok   = True
         for patch in patch_data.get("patches", []):
             repo_path = patch.get("filename")
             original  = patch.get("original_snippet", "")
             fixed     = patch.get("fixed_snippet", "")
 
             current = get_file_content(repo_path, branch)
-            if original not in current:
-                result.error = f"Snippet not found in {repo_path} — possible hallucination"
-                print(f"  ✗ Snippet not found in {repo_path}")
+
+            if not find_snippet(current, original):
+                result.error = f"Snippet not found in {repo_path}"
+                print(f"  ✗ {result.error}")
                 apply_ok = False
                 break
 
-            patched = current.replace(original, fixed, 1)
+            patched = apply_snippet(current, original, fixed)
             push_file(repo_path, patched,
                       f"[agent] fix attempt {attempt}: {patch_data.get('analysis','')[:60]}",
                       branch)
+            # Update local copy for next iteration
+            broken_contents[repo_path] = patched
             diff_lines.append(f"Patched {repo_path}")
             print(f"  ✓ Applied patch to {repo_path}")
 
@@ -382,9 +394,8 @@ def heal_scenario(scenario: Scenario, run_index: int) -> list[RunResult]:
             continue
 
         result.patch_applied = True
-        result.patch_diff = "\n".join(diff_lines)
+        result.patch_diff    = "\n".join(diff_lines)
 
-        # Wait for CI
         conclusion, ci_logs = wait_for_ci(branch)
         result.ci_green = conclusion == "success"
 
@@ -394,14 +405,8 @@ def heal_scenario(scenario: Scenario, run_index: int) -> list[RunResult]:
             results.append(result)
             break
         else:
-            print(f"  ✗ Pipeline still failing (attempt {attempt})")
-            # Re-read current files for next attempt
-            for repo_path in scenario.broken_files.keys():
-                broken_contents[repo_path] = get_file_content(repo_path, branch)
+            print(f"  ✗ Still failing (attempt {attempt})")
             results.append(result)
-
-    # Cleanup: delete experiment branch after run
-    # delete_branch(branch)  # comment out if you want to inspect branches on GitHub
 
     return results
 
@@ -409,7 +414,7 @@ def heal_scenario(scenario: Scenario, run_index: int) -> list[RunResult]:
 # ── Scenario definitions ──────────────────────────────────────────────────────
 
 def get_scenarios() -> list[Scenario]:
-    base = "scenarios"   # local folder with broken files
+    base = "scenarios"
     return [
         Scenario(
             id="functional_regression",
@@ -437,6 +442,8 @@ def get_scenarios() -> list[Scenario]:
                 "src/services/user.py":  f"{base}/architectural_regression_user.py",
                 "src/services/order.py": f"{base}/architectural_regression_order.py",
             },
+            # FIX 3: LLM sieht was in src/data.py wirklich existiert
+            context_files=["src/data.py"],
         ),
     ]
 
@@ -449,11 +456,11 @@ def run_experiment(runs_per_scenario: int = 3):
     if not ollama_available():
         raise SystemExit("ERROR: Ollama not running. Start with: ollama serve")
 
-    scenarios = get_scenarios()
+    scenarios    = get_scenarios()
     all_results: list[RunResult] = []
 
     print(f"\n{'═'*60}")
-    print(f"  THESIS EXPERIMENT")
+    print(f"  THESIS EXPERIMENT — v2")
     print(f"  {len(scenarios)} scenarios × {runs_per_scenario} runs × {MAX_ATTEMPTS} attempts")
     print(f"  Model: {OLLAMA_MODEL}")
     print(f"{'═'*60}")
@@ -463,7 +470,7 @@ def run_experiment(runs_per_scenario: int = 3):
             results = heal_scenario(scenario, run_idx)
             all_results.extend(results)
 
-    # ── Summary ───────────────────────────────────────────────────────────────
+    # Summary
     print(f"\n{'═'*60}")
     print("  RESULTS SUMMARY")
     print(f"{'─'*60}")
@@ -471,22 +478,21 @@ def run_experiment(runs_per_scenario: int = 3):
     print(f"{'─'*60}")
 
     for scenario in scenarios:
-        s_results = [r for r in all_results if r.scenario_id == scenario.id]
-        total     = len(s_results)
-        if total == 0:
+        s_res = [r for r in all_results if r.scenario_id == scenario.id]
+        total = len(s_res)
+        if not total:
             continue
-        fsr = sum(1 for r in s_results if r.ci_green) / runs_per_scenario
-        vpr = sum(1 for r in s_results if r.patch_applied) / total
-        hr  = sum(1 for r in s_results if r.hallucination) / total
-        ttr = [r.time_to_recovery for r in s_results if r.time_to_recovery]
+        fsr = sum(1 for r in s_res if r.ci_green) / runs_per_scenario
+        vpr = sum(1 for r in s_res if r.patch_applied) / total
+        hr  = sum(1 for r in s_res if r.hallucination) / total
+        ttr = [r.time_to_recovery for r in s_res if r.time_to_recovery]
         ttr_avg = f"{sum(ttr)/len(ttr):.0f}s" if ttr else "N/A"
         print(f"{scenario.id:<35} {fsr:>4.0%}  {vpr:>4.0%}  {hr:>4.0%}  {ttr_avg:>6}")
 
     print(f"{'─'*60}")
-    print("FSR=Fix Success Rate | VPR=Valid Patch Rate | HR=Hallucination Rate | TTR=Time to Recovery")
+    print("FSR | VPR | HR | TTR")
 
-    # Save full results
-    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    ts  = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     os.makedirs("results", exist_ok=True)
     out = f"results/experiment_{ts}.json"
     with open(out, "w") as f:
