@@ -12,9 +12,10 @@ Fixes vs v1:
 import base64
 import json
 import os
+import re
 import time
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import requests
@@ -58,6 +59,7 @@ class RunResult:
     llm_raw: str = ""
     patch_diff: str = ""
     error: str = ""
+    detected_type: str = ""
     timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
 
 
@@ -121,36 +123,98 @@ def get_file_content(repo_path: str, branch: str) -> str:
     return base64.b64decode(data["content"]).decode()
 
 
-def wait_for_ci(branch: str) -> tuple[str, str]:
+def get_latest_run_id(branch: str) -> Optional[int]:
+    """Gibt die ID des aktuell neuesten CI-Runs auf diesem Branch zurück."""
+    runs = gh("GET", "/actions/runs", params={"branch": branch, "per_page": 1}).get("workflow_runs", [])
+    return runs[0]["id"] if runs else None
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def wait_for_ci(branch: str, after_run_id: Optional[int] = None,
+                not_before: Optional[datetime] = None) -> tuple[str, str]:
+    """
+    Wartet auf einen abgeschlossenen CI-Run auf dem Branch.
+    not_before: Nur Runs akzeptieren, die nach diesem UTC-Zeitpunkt gestartet wurden.
+    after_run_id: Fallback-Filter per Run-ID (Legacy-Support).
+    """
     print(f"  ⏳ Waiting for CI on '{branch}'...", end="", flush=True)
     deadline = time.time() + CI_TIMEOUT
-    seen_run_id = None
 
     while time.time() < deadline:
         time.sleep(CI_POLL_SEC)
-        runs = gh("GET", "/actions/runs", params={"branch": branch, "per_page": 5}).get("workflow_runs", [])
+        runs = gh("GET", "/actions/runs", params={
+            "branch": branch,
+            "per_page": 5,
+        }).get("workflow_runs", [])
+
         if not runs:
             print(".", end="", flush=True)
             continue
 
-        run = runs[0]
+        run = runs[0]  # neuester Run
+
+        # Timestamp-Filter: überspringe Runs, die vor unserem Push-Zeitpunkt gestartet sind
+        if not_before is not None:
+            run_created = datetime.fromisoformat(
+                run["created_at"].replace("Z", "+00:00")
+            )
+            if run_created <= not_before:
+                print(".", end="", flush=True)
+                continue
+
+        # Legacy-Filter per Run-ID
+        if after_run_id and run["id"] <= after_run_id:
+            print(".", end="", flush=True)
+            continue
+
         if run["status"] == "completed":
             print(f" {run['conclusion']}")
             return run["conclusion"], fetch_ci_logs(run["id"])
+
         print(".", end="", flush=True)
 
     print(" TIMEOUT")
     return "timeout", ""
 
 
+def gh_raw_text(path: str) -> str:
+    url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}{path}"
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    resp = requests.get(url, headers=headers, allow_redirects=True, timeout=30)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"GitHub API GET {path} → {resp.status_code}")
+    return resp.text
+
+
 def fetch_ci_logs(run_id: int) -> str:
     jobs = gh("GET", f"/actions/runs/{run_id}/jobs").get("jobs", [])
     parts = []
     for job in jobs:
-        parts.append(f"=== JOB: {job['name']} [{job['conclusion']}] ===")
-        for step in job.get("steps", []):
-            if step.get("conclusion") == "failure":
-                parts.append(f"  FAILED STEP: {step['name']}")
+        conclusion = job.get("conclusion", "")
+        parts.append(f"=== JOB: {job['name']} [{conclusion}] ===")
+        if conclusion != "failure":
+            continue
+        try:
+            raw_log = gh_raw_text(f"/actions/jobs/{job['id']}/logs")
+            lines = []
+            for line in raw_log.splitlines():
+                clean = re.sub(r'^\d{4}-\d{2}-\d{2}T[\d:.]+Z ', '', line)
+                # strip absolute runner paths so the LLM sees relative paths only
+                clean = re.sub(r'/home/runner/work/[^/]+/[^/]+/', '', clean)
+                if clean.strip() and not clean.startswith('##[group]') and not clean.startswith('##[endgroup]'):
+                    lines.append(clean)
+            parts.extend(lines[-100:])
+        except Exception:
+            for step in job.get("steps", []):
+                if step.get("conclusion") == "failure":
+                    parts.append(f"  FAILED STEP: {step['name']}")
     return "\n".join(parts)
 
 
@@ -174,39 +238,81 @@ def ollama_generate(prompt: str) -> str:
     return resp.json().get("response", "")
 
 
-# ── FIX 1 + FIX 3: Verbesserter Prompt ───────────────────────────────────────
+def llm_classify(ci_logs: str) -> str:
+    """First LLM call: classify the CI failure type from the log."""
+    prompt = f"""Classify this CI/CD pipeline failure into exactly one category.
+
+CI LOG:
+---
+{ci_logs[:1000]}
+---
+
+Categories:
+- functional: wrong logic or output (pytest test assertions fail, wrong return values)
+- syntactic: code style violations (flake8 errors like E302, E711, W291, E501)
+- configurational: wrong dependency version (pip install fails, package not found on PyPI)
+- architectural: circular imports or unused cross-module imports (F401, ImportError between services)
+
+Respond with ONLY the category name and nothing else. Example: functional"""
+    try:
+        raw = ollama_generate(prompt).strip().lower()
+    except Exception:
+        return "unknown"
+    valid = {"functional", "syntactic", "configurational", "architectural"}
+    for word in re.split(r'\W+', raw):
+        if word in valid:
+            return word
+    return "unknown"
+
+
+# ── Prompt builder ────────────────────────────────────────────────────────────
+
+_TYPE_HINTS: dict[str, str] = {
+    "configurational": (
+        "For requirements.txt: only use well-known stable PyPI versions. "
+        "Safe choices: requests → 2.28.0 or 2.31.0; pytest → 7.4.3 or 7.2.0; flake8 → 6.1.0. "
+        "IMPORTANT: pytest 6.x is NOT compatible with this project (requires pytest 7+). "
+        "Do NOT invent or guess version numbers."
+    ),
+    "architectural": (
+        "DELETE the import line that causes the circular dependency. "
+        "The fixed file must contain ZERO import statements.\n"
+        "WRONG (do NOT do this):\n"
+        "  from src.services.other import OtherService  ← this line must be DELETED\n"
+        "  class MyService:\n"
+        "      def foo(self): ...\n"
+        "CORRECT (do this):\n"
+        "  class MyService:\n"
+        "      def foo(self): ...\n"
+        "CRITICAL: The fixed file must start directly with 'class ...' — no import statements at all. "
+        "Any remaining import causes F401 and fails CI."
+    ),
+}
+
 
 def build_prompt(failure_type: str, ci_logs: str,
                  broken_files: dict[str, str],
                  context_files: dict[str, str] = None) -> str:
 
-    # Broken files block
     files_block = "\n\n".join(
-        f"### FILE TO FIX: {path}\n```python\n{content}\n```"
+        f"### FILE TO FIX: {path}\n```\n{content}\n```"
         for path, content in broken_files.items()
     )
 
-    # FIX 3: context files block (read-only, e.g. src/data.py)
     context_block = ""
     if context_files:
-        context_block = "\n\nCONTEXT FILES (do NOT patch these, use them as reference):\n"
+        context_block = "\n\nCONTEXT FILES (read-only reference, do NOT patch):\n"
         context_block += "\n\n".join(
-            f"### CONTEXT: {path}\n```python\n{content}\n```"
+            f"### CONTEXT: {path}\n```\n{content}\n```"
             for path, content in context_files.items()
         )
 
-    # FIX 1: Architectural extra instruction
-    arch_note = ""
-    if failure_type == "architectural":
-        arch_note = """
-ARCHITECTURAL NOTE:
-- Fix ALL files that contribute to the circular dependency, not just one.
-- Only import symbols that actually exist in the referenced module (check CONTEXT FILES).
-- The correct fix is to remove the cross-service import and use the shared data layer instead.
-"""
+    hint = _TYPE_HINTS.get(failure_type, "")
+    hint_block = f"\n\nADDITIONAL CONTEXT:\n{hint}" if hint else ""
+
+    file_list = "\n".join(f"  {p}" for p in broken_files)
 
     return f"""You are an expert DevOps engineer fixing a CI/CD pipeline failure.
-Respond ONLY with a valid JSON object. No prose, no markdown fences.
 
 FAILURE TYPE: {failure_type}
 
@@ -215,58 +321,54 @@ CI LOG:
 {ci_logs[:2000]}
 ---
 
-{files_block}{context_block}{arch_note}
+{files_block}{context_block}{hint_block}
 
-RULES FOR PATCHES:
-1. original_snippet MUST include the complete function or class block — never just a single line.
-   This guarantees the snippet is unique in the file and can be matched exactly.
-2. fixed_snippet replaces original_snippet entirely. Keep indentation consistent.
-3. Only patch FILES TO FIX listed above. Never patch CONTEXT FILES.
-4. Only reference symbols that actually exist in the codebase (check CONTEXT FILES).
+INSTRUCTIONS:
+- Fix the failure shown in the CI log.
+- Return the COMPLETE corrected content for each broken file.
+- Only fix FILES TO FIX. Never modify CONTEXT FILES.
+- Only reference symbols that exist in the codebase.
 
-Respond with ONLY this JSON — no other text:
-{{
-  "analysis": "<one sentence root-cause>",
-  "confidence": <0.0-1.0>,
-  "patches": [
-    {{
-      "filename": "<exact path>",
-      "original_snippet": "<complete function/block — must be unique in the file>",
-      "fixed_snippet": "<replacement>"
-    }}
-  ],
-  "hallucination_risk": "<low|medium|high>",
-  "requires_human_review": <true|false>
-}}"""
+Respond in EXACTLY this format (no other text):
 
+{{"analysis": "<one sentence root-cause>", "confidence": <0.0-1.0>}}
+===FILE: <exact path>===
+<complete corrected file content>
+===ENDFILE===
 
-# ── FIX 2: Whitespace-normalisiertes Snippet-Matching ────────────────────────
-
-def normalize_ws(text: str) -> str:
-    """Entfernt trailing whitespace pro Zeile — löst Syntactic-Mismatch."""
-    return "\n".join(line.rstrip() for line in text.split("\n"))
-
-
-def find_snippet(content: str, snippet: str) -> bool:
-    """Prüft ob snippet im content steht — mit und ohne Whitespace-Normalisierung."""
-    if snippet in content:
-        return True
-    # FIX 2: Fallback mit normalisiertem Vergleich
-    return normalize_ws(snippet) in normalize_ws(content)
-
-
-def apply_snippet(content: str, original: str, replacement: str) -> str:
-    """Ersetzt original durch replacement — normalisiert bei Bedarf."""
-    if original in content:
-        return content.replace(original, replacement, 1)
-    # FIX 2: Normalisierter Fallback
-    norm_content  = normalize_ws(content)
-    norm_original = normalize_ws(original)
-    norm_replace  = normalize_ws(replacement)
-    return norm_content.replace(norm_original, norm_replace, 1)
+Files to fix:
+{file_list}"""
 
 
 def parse_patch(raw: str) -> Optional[dict]:
+    # Extract JSON metadata from any line that looks like a self-contained JSON object
+    metadata: dict = {}
+    for line in raw.splitlines():
+        line = line.strip()
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                metadata = json.loads(line)
+                break
+            except json.JSONDecodeError:
+                pass
+
+    # Extract ===FILE: path===...===ENDFILE=== blocks (no JSON escaping needed)
+    patches = []
+    for m in re.finditer(r'===FILE:[ \t]*([\w./ -]+?)[ \t]*===\n?([\s\S]*?)===ENDFILE===', raw):
+        filename = m.group(1).strip().lstrip('/')
+        content  = m.group(2).strip("\n")
+        patches.append({"filename": filename, "fixed_content": content})
+
+    if patches:
+        return {
+            "analysis":              metadata.get("analysis", ""),
+            "confidence":            metadata.get("confidence", 0.0),
+            "patches":               patches,
+            "hallucination_risk":    metadata.get("hallucination_risk", "unknown"),
+            "requires_human_review": metadata.get("requires_human_review", False),
+        }
+
+    # Fallback: standard JSON parse (catches cases where the model ignores format instructions)
     clean = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
     try:
         return json.loads(clean)
@@ -280,6 +382,34 @@ def parse_patch(raw: str) -> Optional[dict]:
     return None
 
 
+def strip_code_fences(content: str) -> str:
+    """Entfernt führende/nachfolgende Markdown-Code-Fences aus dem Dateiinhalt."""
+    lines = content.strip().splitlines()
+    if lines and re.match(r'^```[\w]*$', lines[0].strip()):
+        lines = lines[1:]
+    if lines and lines[-1].strip() == '```':
+        lines = lines[:-1]
+    return '\n'.join(lines)
+
+
+def fix_blank_lines(content: str) -> str:
+    """Stellt sicher dass 2 Leerzeilen vor top-level def/class stehen (PEP8 E302)."""
+    lines = content.split('\n')
+    result = []
+    for i, line in enumerate(lines):
+        if line.startswith(('def ', 'class ')) and result:
+            blanks = 0
+            j = len(result) - 1
+            while j >= 0 and result[j].strip() == '':
+                blanks += 1
+                j -= 1
+            while blanks < 2:
+                result.append('')
+                blanks += 1
+        result.append(line)
+    return '\n'.join(result)
+
+
 # ── Healing loop ──────────────────────────────────────────────────────────────
 
 def heal_scenario(scenario: Scenario, run_index: int) -> list[RunResult]:
@@ -291,7 +421,13 @@ def heal_scenario(scenario: Scenario, run_index: int) -> list[RunResult]:
     print(f"Scenario : {scenario.id}  [{scenario.failure_type}]  run={run_index}")
     print(f"Branch   : {branch}")
 
+    delete_branch(branch)   # remove stale branch from any previous run
     create_branch(branch)
+
+    # Record timestamp before injection. GitHub triggers a clean CI run on branch
+    # creation (healthy state = would pass). We use the timestamp so wait_for_ci
+    # only accepts runs triggered AFTER our broken-file injection, not that clean run.
+    t_inject = utc_now()
 
     # Inject broken files
     for repo_path, local_path in scenario.broken_files.items():
@@ -301,8 +437,9 @@ def heal_scenario(scenario: Scenario, run_index: int) -> list[RunResult]:
                   f"[experiment] inject {scenario.failure_type} regression", branch)
         print(f"  ✓ Injected: {repo_path}")
 
-    # Wait for CI to fail
-    conclusion, ci_logs = wait_for_ci(branch)
+    # Wait for CI to fail — only accept runs started after injection
+    conclusion, ci_logs = wait_for_ci(branch, not_before=t_inject)
+    last_run_id = get_latest_run_id(branch)
     if conclusion == "success":
         print("  ⚠  CI passed with broken files — check scenario definition")
         return results
@@ -351,43 +488,55 @@ def heal_scenario(scenario: Scenario, run_index: int) -> list[RunResult]:
 
         print(f"  → {patch_data.get('analysis', 'N/A')}  (confidence={patch_data.get('confidence','?')})")
 
-        # Hallucination check
-        known = set(scenario.broken_files.keys())
-        for p in patch_data.get("patches", []):
-            if p.get("filename") not in known:
-                result.hallucination = True
-                result.error = f"Hallucination: unknown file '{p.get('filename')}'"
-                print(f"  ⚠  {result.error}")
-                break
+        # Apply patches — full file replacement
+        known        = set(scenario.broken_files.keys())
+        diff_lines   = []
+        apply_ok     = True
+        t_last_push  = utc_now()  # updated just before each push; final value = last push time
+        patches_list = patch_data.get("patches", [])
+        for patch_idx, patch in enumerate(patches_list):
+            repo_path     = patch.get("filename")
+            fixed_content = patch.get("fixed_content", "")
 
-        if result.hallucination:
-            results.append(result)
-            continue
+            if repo_path not in known:
+                # Normalize runner absolute paths by matching known file suffixes
+                # e.g. "home/runner/work/repo/repo/requirements.txt" → "requirements.txt"
+                normalized = next(
+                    (k for k in known if repo_path == k or repo_path.endswith('/' + k)),
+                    None,
+                )
+                if normalized:
+                    print(f"  ~ Normalized path '{repo_path}' → '{normalized}'")
+                    repo_path = normalized
+                else:
+                    result.hallucination = True
+                    result.error = f"Hallucination: unknown file '{repo_path}'"
+                    print(f"  ⚠  {result.error}")
+                    apply_ok = False
+                    break
 
-        # Apply patches (FIX 1 + FIX 2)
-        diff_lines = []
-        apply_ok   = True
-        for patch in patch_data.get("patches", []):
-            repo_path = patch.get("filename")
-            original  = patch.get("original_snippet", "")
-            fixed     = patch.get("fixed_snippet", "")
-
-            current = get_file_content(repo_path, branch)
-
-            if not find_snippet(current, original):
-                result.error = f"Snippet not found in {repo_path}"
+            if not fixed_content.strip():
+                result.error = f"Empty fixed_content for {repo_path}"
                 print(f"  ✗ {result.error}")
                 apply_ok = False
                 break
 
-            patched = apply_snippet(current, original, fixed)
-            push_file(repo_path, patched,
-                      f"[agent] fix attempt {attempt}: {patch_data.get('analysis','')[:60]}",
-                      branch)
-            # Update local copy for next iteration
-            broken_contents[repo_path] = patched
-            diff_lines.append(f"Patched {repo_path}")
-            print(f"  ✓ Applied patch to {repo_path}")
+            fixed_content = strip_code_fences(fixed_content)
+            fixed_content = fix_blank_lines(fixed_content)
+            if not fixed_content.endswith('\n'):
+                fixed_content += '\n'
+
+            # Timestamp just before the push so wait_for_ci skips CI runs from
+            # earlier pushes (intermediate states) in multi-file scenarios.
+            t_last_push = utc_now()
+            push_file(
+                repo_path, fixed_content,
+                f"[agent] fix attempt {attempt}: {patch_data.get('analysis','')[:60]}",
+                branch,
+            )
+            broken_contents[repo_path] = fixed_content
+            diff_lines.append(f"Replaced {repo_path} (full file)")
+            print(f"  ✓ Replaced: {repo_path}")
 
         if not apply_ok:
             results.append(result)
@@ -396,7 +545,9 @@ def heal_scenario(scenario: Scenario, run_index: int) -> list[RunResult]:
         result.patch_applied = True
         result.patch_diff    = "\n".join(diff_lines)
 
-        conclusion, ci_logs = wait_for_ci(branch)
+        # Only accept the CI run triggered by the LAST push (not intermediate runs)
+        conclusion, ci_logs = wait_for_ci(branch, not_before=t_last_push)
+        last_run_id = get_latest_run_id(branch)
         result.ci_green = conclusion == "success"
 
         if result.ci_green:
@@ -423,16 +574,34 @@ def get_scenarios() -> list[Scenario]:
             broken_files={"src/calculator.py": f"{base}/functional_regression.py"},
         ),
         Scenario(
+            id="functional_regression_2",
+            failure_type="functional",
+            description="Inverted clamp() logic in utils.py",
+            broken_files={"src/utils.py": f"{base}/functional_regression_2.py"},
+        ),
+        Scenario(
             id="syntactic_regression",
             failure_type="syntactic",
             description="PEP8 violations in utils.py",
             broken_files={"src/utils.py": f"{base}/syntactic_regression.py"},
         ),
         Scenario(
+            id="syntactic_regression_2",
+            failure_type="syntactic",
+            description="E711 comparison to None in data.py",
+            broken_files={"src/data.py": f"{base}/syntactic_regression_2.py"},
+        ),
+        Scenario(
             id="configurational_regression",
             failure_type="configurational",
             description="Nonexistent package version in requirements.txt",
             broken_files={"requirements.txt": f"{base}/configurational_regression.txt"},
+        ),
+        Scenario(
+            id="configurational_regression_2",
+            failure_type="configurational",
+            description="Nonexistent pytest version in requirements.txt",
+            broken_files={"requirements.txt": f"{base}/configurational_regression_2.txt"},
         ),
         Scenario(
             id="architectural_regression",
@@ -442,8 +611,6 @@ def get_scenarios() -> list[Scenario]:
                 "src/services/user.py":  f"{base}/architectural_regression_user.py",
                 "src/services/order.py": f"{base}/architectural_regression_order.py",
             },
-            # FIX 3: LLM sieht was in src/data.py wirklich existiert
-            context_files=["src/data.py"],
         ),
     ]
 
@@ -460,7 +627,7 @@ def run_experiment(runs_per_scenario: int = 3):
     all_results: list[RunResult] = []
 
     print(f"\n{'═'*60}")
-    print(f"  THESIS EXPERIMENT — v2")
+    print(f"  THESIS EXPERIMENT — v5")
     print(f"  {len(scenarios)} scenarios × {runs_per_scenario} runs × {MAX_ATTEMPTS} attempts")
     print(f"  Model: {OLLAMA_MODEL}")
     print(f"{'═'*60}")

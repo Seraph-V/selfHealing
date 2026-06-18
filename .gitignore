@@ -40,3 +40,7 @@ Thumbs.db
 .env
 .env.local
 .env.*.local
+
+#AI
+Claude.md
+Handoff.md

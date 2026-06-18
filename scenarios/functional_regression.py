@@ -1,23 +1,19 @@
-"""
-SCENARIO: functional_regression
-TYPE: Functional
-BROKEN: Wrong operators in arithmetic functions.
-
-This file replaces src/calculator.py to trigger the CI failure.
-The agent must fix the operators: - → +, + → -, + → *
-"""
+# SCENARIO: functional_regression
+# TYPE: Functional
+# BROKEN: wrong arithmetic operators
+# Replaces src/calculator.py to trigger CI failure.
 
 
 def add(a: float, b: float) -> float:
-    return a - b  # BUG: should be +
+    return a - b
 
 
 def subtract(a: float, b: float) -> float:
-    return a + b  # BUG: should be -
+    return a + b
 
 
 def multiply(a: float, b: float) -> float:
-    return a + b  # BUG: should be *
+    return a + b
 
 
 def divide(a: float, b: float) -> float:
