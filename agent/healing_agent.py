@@ -1,12 +1,11 @@
 """
-Self-Healing CI Agent — v2 (bugfixed)
+Self-Healing CI Agent — v7 (fully autonomous)
 Bachelor Thesis — Valentin Jurke
 
-Fixes vs v1:
-  FIX 1 (functional)  : Prompt verlangt jetzt vollständige Funktion als Snippet → eindeutig
-  FIX 2 (syntactic)   : Whitespace-normalisiertes Snippet-Matching
-  FIX 3 (architectural): context_files zeigt LLM was in src/data.py existiert;
-                         Prompt fordert Fixes für ALLE betroffenen Dateien
+v7 changes:
+  - Scenarios have no predefined failure_type; agent classifies from CI logs only
+  - Files to fix are scraped from CI logs (regex + LLM fallback); not hardcoded
+  - ground_truth_type kept in Scenario for evaluation metrics only, not used by agent
 """
 
 import base64
@@ -40,10 +39,9 @@ CI_TIMEOUT    = 300
 @dataclass
 class Scenario:
     id: str
-    failure_type: str
     description: str
-    broken_files: dict[str, str]       # repo_path → local broken file
-    context_files: list[str] = field(default_factory=list)  # FIX 3: extra read-only context
+    broken_files: dict[str, str]        # repo_path → local broken file (injection only)
+    ground_truth_type: str = ""         # for accuracy metrics only — agent must NOT use this
 
 
 @dataclass
@@ -238,31 +236,100 @@ def ollama_generate(prompt: str) -> str:
     return resp.json().get("response", "")
 
 
-def llm_classify(ci_logs: str) -> str:
-    """First LLM call: classify the CI failure type from the log."""
-    prompt = f"""Classify this CI/CD pipeline failure into exactly one category.
 
-CI LOG:
+def localize_failure(ci_log: str) -> tuple[str, list[str]]:
+    """
+    Extrahiert Fehlertyp und betroffene Dateipfade aus dem CI-Log.
+
+    Returns:
+        tuple[failure_type, list[affected_file_paths]]
+        failure_type: "functional" | "syntactic" |
+                      "configurational" | "architectural" | "unknown"
+    """
+    files: set[str] = set()
+    failure_type = "unknown"
+
+    # ── Configurational (pip) ─────────────────────────────────────
+    if any(msg in ci_log for msg in [
+        "No matching distribution",
+        "ResolutionImpossible",
+        "Could not find a version",
+        "not find a version that satisfies",
+    ]):
+        failure_type = "configurational"
+        files.add("requirements.txt")
+
+    # ── Architectural: F401 / circular import ─────────────────────
+    # Must be checked before syntactic — F401 is a flake8 code but
+    # indicates an import problem, not a style violation.
+    elif any(msg in ci_log for msg in [
+        "ImportError",
+        "circular import",
+        "cannot import name",
+        "partially initialized module",
+        "F401",
+    ]):
+        failure_type = "architectural"
+        for m in re.findall(r'from (src[\w.]+) import', ci_log):
+            files.add(m.replace(".", "/") + ".py")
+        for m in re.findall(r'(src/[\w/]+\.py):\d+:\d+: F4', ci_log):
+            files.add(m)
+
+    # ── Syntactic: E/W/C flake8 codes (style violations) ─────────
+    elif any(code in ci_log for code in ["E302", "E711", "E501", "W291"]):
+        failure_type = "syntactic"
+        for m in re.findall(r'(src/[\w/]+\.py):\d+:\d+:', ci_log):
+            files.add(m)
+
+    # ── Functional (pytest) ───────────────────────────────────────
+    elif any(msg in ci_log for msg in [
+        "FAILED", "AssertionError", "assert"
+    ]):
+        failure_type = "functional"
+        # --tb=long shows function bodies: "from src.calculator import add"
+        for m in re.findall(r'from (src(?:\.\w+)+) import', ci_log):
+            files.add(m.replace(".", "/") + ".py")
+        # Fallback naming convention: FAILED tests/test_X.py → src/X.py
+        if not files:
+            for m in re.findall(r'FAILED tests/test_(\w+)\.py', ci_log):
+                files.add(f"src/{m}.py")
+
+    return failure_type, list(files)
+
+
+def localize_functional_source(
+    ci_log: str,
+    test_files: list[str],
+) -> list[str]:
+    """
+    Zweiter LLM-Call nur für functional regression:
+    Leitet Source-Dateipfad aus Test-Dateiname und Log ab.
+    Wird nur aufgerufen wenn localize_failure() "functional" zurückgibt
+    und die direkte Zuordnung (test_X.py → src/X.py) fehlschlägt.
+    """
+    prompt = f"""A CI pipeline failed with the following pytest output:
 ---
-{ci_logs[:1000]}
+{ci_log[:1500]}
 ---
 
-Categories:
-- functional: wrong logic or output (pytest test assertions fail, wrong return values)
-- syntactic: code style violations (flake8 errors like E302, E711, W291, E501)
-- configurational: wrong dependency version (pip install fails, package not found on PyPI)
-- architectural: circular imports or unused cross-module imports (F401, ImportError between services)
+The failing test files are: {test_files}
 
-Respond with ONLY the category name and nothing else. Example: functional"""
+Which source file(s) in the src/ directory are most likely
+responsible for these test failures?
+
+Respond with ONLY a JSON array of file paths, no other text:
+["src/example.py"]"""
+
+    raw = ollama_generate(prompt)
     try:
-        raw = ollama_generate(prompt).strip().lower()
+        clean = (raw.strip()
+                 .removeprefix("```json")
+                 .removeprefix("```")
+                 .removesuffix("```")
+                 .strip())
+        return json.loads(clean)
     except Exception:
-        return "unknown"
-    valid = {"functional", "syntactic", "configurational", "architectural"}
-    for word in re.split(r'\W+', raw):
-        if word in valid:
-            return word
-    return "unknown"
+        return test_files
 
 
 # ── Prompt builder ────────────────────────────────────────────────────────────
@@ -275,17 +342,12 @@ _TYPE_HINTS: dict[str, str] = {
         "Do NOT invent or guess version numbers."
     ),
     "architectural": (
-        "DELETE the import line that causes the circular dependency. "
-        "The fixed file must contain ZERO import statements.\n"
-        "WRONG (do NOT do this):\n"
-        "  from src.services.other import OtherService  ← this line must be DELETED\n"
-        "  class MyService:\n"
-        "      def foo(self): ...\n"
-        "CORRECT (do this):\n"
-        "  class MyService:\n"
-        "      def foo(self): ...\n"
-        "CRITICAL: The fixed file must start directly with 'class ...' — no import statements at all. "
-        "Any remaining import causes F401 and fails CI."
+        "DELETE every 'from src.services...' import line from each broken file. "
+        "The fixed files must contain ZERO import statements from src.services. "
+        "WRONG: leaving 'from src.services.X import Y' in the file. "
+        "CORRECT: that line is deleted — the file starts directly with 'class ...'. "
+        "CRITICAL: Any remaining src.services import causes F401 and fails CI. "
+        "Do NOT invent or reference files that are not listed under FILES TO FIX."
     ),
 }
 
@@ -418,7 +480,7 @@ def heal_scenario(scenario: Scenario, run_index: int) -> list[RunResult]:
     t_start = time.time()
 
     print(f"\n{'─'*60}")
-    print(f"Scenario : {scenario.id}  [{scenario.failure_type}]  run={run_index}")
+    print(f"Scenario : {scenario.id}  run={run_index}")
     print(f"Branch   : {branch}")
 
     delete_branch(branch)   # remove stale branch from any previous run
@@ -434,7 +496,7 @@ def heal_scenario(scenario: Scenario, run_index: int) -> list[RunResult]:
         with open(local_path) as f:
             broken_content = f.read()
         push_file(repo_path, broken_content,
-                  f"[experiment] inject {scenario.failure_type} regression", branch)
+                  f"[experiment] inject regression: {scenario.id}", branch)
         print(f"  ✓ Injected: {repo_path}")
 
     # Wait for CI to fail — only accept runs started after injection
@@ -446,26 +508,59 @@ def heal_scenario(scenario: Scenario, run_index: int) -> list[RunResult]:
 
     print(f"  ✗ CI failed as expected")
 
-    # Read broken file contents + FIX 3: context files from main
+    # Dynamische Fault Localization aus CI-Log
+    failure_type, affected_files = localize_failure(ci_logs)
+    detected_type = failure_type
+    gt = scenario.ground_truth_type
+    match_sym = ("✓" if detected_type == gt else "✗") if gt else ""
+    gt_label   = f" (ground truth: '{gt}')" if gt else ""
+    print(f"  → Failure type detected: {detected_type} {match_sym}{gt_label}")
+    print(f"  → Affected files: {affected_files}")
+
+    # Sonderfall Functional: zweiter LLM-Call wenn direkte Zuordnung fehlschlägt
+    if failure_type == "functional":
+        test_files = affected_files
+        source_files = []
+        for tf in test_files:
+            candidate = tf.replace("tests/test_", "src/")
+            if get_file_sha(candidate, branch):
+                source_files.append(candidate)
+        if not source_files:
+            print("  Calling LLM for functional source localization...",
+                  end="", flush=True)
+            source_files = localize_functional_source(ci_logs, test_files)
+            print(f" {source_files}")
+        affected_files = source_files
+
+    if not affected_files:
+        print("  ⚠  No affected files identified — skipping")
+        return results
+
+    # Dateiinhalte vom Branch laden
     broken_contents: dict[str, str] = {}
-    for repo_path in scenario.broken_files.keys():
-        broken_contents[repo_path] = get_file_content(repo_path, branch)
+    for repo_path in affected_files:
+        try:
+            broken_contents[repo_path] = get_file_content(repo_path, branch)
+        except RuntimeError:
+            print(f"  ⚠  Could not read {repo_path}")
+
+    if not broken_contents:
+        print("  ⚠  Could not read any files to fix — aborting scenario")
+        return results
 
     context_contents: dict[str, str] = {}
-    for repo_path in scenario.context_files:
-        try:
-            context_contents[repo_path] = get_file_content(repo_path, BASE_BRANCH)
-        except Exception:
-            pass
 
     # Attempt fixes
     for attempt in range(1, MAX_ATTEMPTS + 1):
         print(f"\n  [Attempt {attempt}/{MAX_ATTEMPTS}]")
-        result = RunResult(scenario_id=scenario.id, attempt=attempt, branch=branch)
+        result = RunResult(
+            scenario_id=scenario.id, attempt=attempt, branch=branch,
+            detected_type=detected_type,
+        )
 
         # LLM call
         prompt = build_prompt(
-            scenario.failure_type, ci_logs, broken_contents, context_contents
+            detected_type, ci_logs, broken_contents, context_contents
         )
         print("  Calling Ollama...", end="", flush=True)
         try:
@@ -489,7 +584,7 @@ def heal_scenario(scenario: Scenario, run_index: int) -> list[RunResult]:
         print(f"  → {patch_data.get('analysis', 'N/A')}  (confidence={patch_data.get('confidence','?')})")
 
         # Apply patches — full file replacement
-        known        = set(scenario.broken_files.keys())
+        known        = set(affected_files)
         diff_lines   = []
         apply_ok     = True
         t_last_push  = utc_now()  # updated just before each push; final value = last push time
@@ -569,48 +664,48 @@ def get_scenarios() -> list[Scenario]:
     return [
         Scenario(
             id="functional_regression",
-            failure_type="functional",
             description="Wrong arithmetic operators in calculator.py",
             broken_files={"src/calculator.py": f"{base}/functional_regression.py"},
+            ground_truth_type="functional",
         ),
         Scenario(
             id="functional_regression_2",
-            failure_type="functional",
             description="Inverted clamp() logic in utils.py",
             broken_files={"src/utils.py": f"{base}/functional_regression_2.py"},
+            ground_truth_type="functional",
         ),
         Scenario(
             id="syntactic_regression",
-            failure_type="syntactic",
             description="PEP8 violations in utils.py",
             broken_files={"src/utils.py": f"{base}/syntactic_regression.py"},
+            ground_truth_type="syntactic",
         ),
         Scenario(
             id="syntactic_regression_2",
-            failure_type="syntactic",
             description="E711 comparison to None in data.py",
             broken_files={"src/data.py": f"{base}/syntactic_regression_2.py"},
+            ground_truth_type="syntactic",
         ),
         Scenario(
             id="configurational_regression",
-            failure_type="configurational",
             description="Nonexistent package version in requirements.txt",
             broken_files={"requirements.txt": f"{base}/configurational_regression.txt"},
+            ground_truth_type="configurational",
         ),
         Scenario(
             id="configurational_regression_2",
-            failure_type="configurational",
             description="Nonexistent pytest version in requirements.txt",
             broken_files={"requirements.txt": f"{base}/configurational_regression_2.txt"},
+            ground_truth_type="configurational",
         ),
         Scenario(
             id="architectural_regression",
-            failure_type="architectural",
             description="Circular import between user.py and order.py",
             broken_files={
                 "src/services/user.py":  f"{base}/architectural_regression_user.py",
                 "src/services/order.py": f"{base}/architectural_regression_order.py",
             },
+            ground_truth_type="architectural",
         ),
     ]
 
@@ -627,7 +722,7 @@ def run_experiment(runs_per_scenario: int = 3):
     all_results: list[RunResult] = []
 
     print(f"\n{'═'*60}")
-    print(f"  THESIS EXPERIMENT — v5")
+    print(f"  THESIS EXPERIMENT — v7 (fully autonomous)")
     print(f"  {len(scenarios)} scenarios × {runs_per_scenario} runs × {MAX_ATTEMPTS} attempts")
     print(f"  Model: {OLLAMA_MODEL}")
     print(f"{'═'*60}")
@@ -658,6 +753,14 @@ def run_experiment(runs_per_scenario: int = 3):
 
     print(f"{'─'*60}")
     print("FSR | VPR | HR | TTR")
+
+    # Classification accuracy across all runs
+    type_map = {s.id: s.ground_truth_type for s in scenarios}
+    classified = [r for r in all_results if r.detected_type]
+    if classified:
+        correct = sum(1 for r in classified if r.detected_type == type_map.get(r.scenario_id))
+        print(f"\nClassification accuracy: {correct}/{len(classified)} "
+              f"({correct/len(classified):.0%})")
 
     ts  = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     os.makedirs("results", exist_ok=True)
