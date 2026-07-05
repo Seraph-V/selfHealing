@@ -259,16 +259,16 @@ def localize_failure(ci_log: str) -> tuple[str, list[str]]:
         failure_type = "configurational"
         files.add("requirements.txt")
 
-    # ── Architectural: F401 / circular import ─────────────────────
-    # Must be checked before syntactic — F401 is a flake8 code but
-    # indicates an import problem, not a style violation.
-    elif any(msg in ci_log for msg in [
+    # ── Architectural: ImportError / circular import / F4xx as flake8 code ──
+    # "F401" is checked as a flake8 code with file path (src/x.py:L:C: F4...)
+    # NOT as a plain substring — prevents false positives from "# noqa: F401"
+    # comments appearing in pytest --tb=long output.
+    elif (any(msg in ci_log for msg in [
         "ImportError",
         "circular import",
         "cannot import name",
         "partially initialized module",
-        "F401",
-    ]):
+    ]) or re.search(r'src/[\w/]+\.py:\d+:\d+: F4', ci_log)):
         failure_type = "architectural"
         for m in re.findall(r'from (src[\w.]+) import', ci_log):
             files.add(m.replace(".", "/") + ".py")
@@ -335,6 +335,13 @@ Respond with ONLY a JSON array of file paths, no other text:
 # ── Prompt builder ────────────────────────────────────────────────────────────
 
 _TYPE_HINTS: dict[str, str] = {
+    "functional": (
+        "The tests are correct — the source code has a logic error. "
+        "Study each failed assertion: the left side is the actual (wrong) result, "
+        "the right side is the expected (correct) result. "
+        "Fix the implementation to produce the expected values. "
+        "Pay close attention to operator order, min/max nesting, and arithmetic signs."
+    ),
     "configurational": (
         "For requirements.txt: only use well-known stable PyPI versions. "
         "Safe choices: requests → 2.28.0 or 2.31.0; pytest → 7.4.3 or 7.2.0; flake8 → 6.1.0. "
@@ -342,12 +349,14 @@ _TYPE_HINTS: dict[str, str] = {
         "Do NOT invent or guess version numbers."
     ),
     "architectural": (
-        "DELETE every 'from src.services...' import line from each broken file. "
-        "The fixed files must contain ZERO import statements from src.services. "
-        "WRONG: leaving 'from src.services.X import Y' in the file. "
-        "CORRECT: that line is deleted — the file starts directly with 'class ...'. "
-        "CRITICAL: Any remaining src.services import causes F401 and fails CI. "
-        "Do NOT invent or reference files that are not listed under FILES TO FIX."
+        "The broken file contains a circular import line such as "
+        "'from src.services.X import Y'. "
+        "DELETE that import line completely — do not replace it with anything. "
+        "The fixed file must start directly with 'class ...' and contain "
+        "ZERO import statements from src.services. "
+        "WRONG: any remaining 'from src.services...' line — causes F401 and fails CI. "
+        "CORRECT: the import line is gone; class definition comes first. "
+        "Do NOT invent or reference files not listed under FILES TO FIX."
     ),
 }
 
@@ -483,15 +492,30 @@ def heal_scenario(scenario: Scenario, run_index: int) -> list[RunResult]:
     print(f"Scenario : {scenario.id}  run={run_index}")
     print(f"Branch   : {branch}")
 
+    # Record latest run ID *before* deleting, so we can filter out old runs
+    # from prior experiments that GitHub keeps associated with this branch name.
+    pre_delete_id = get_latest_run_id(branch) or 0
+
     delete_branch(branch)   # remove stale branch from any previous run
     create_branch(branch)
 
-    # Record timestamp before injection. GitHub triggers a clean CI run on branch
-    # creation (healthy state = would pass). We use the timestamp so wait_for_ci
-    # only accepts runs triggered AFTER our broken-file injection, not that clean run.
-    t_inject = utc_now()
+    # Wait for the branch-creation CI run (healthy code → would pass) to be
+    # registered in GitHub Actions. We record its ID as a baseline so that
+    # wait_for_ci() can use after_run_id to guarantee it only accepts the run
+    # triggered by our broken-file injection — not the healthy branch-creation run.
+    # Without this, a race exists: GitHub schedules the clean run asynchronously
+    # and its created_at may land after t_inject, bypassing the not_before filter.
+    baseline_run_id = pre_delete_id
+    for _ in range(12):  # poll up to 60 s (12 × 5 s)
+        time.sleep(5)
+        rid = get_latest_run_id(branch)
+        if rid and rid > pre_delete_id:
+            baseline_run_id = rid
+            print(f"  ✓ Branch-creation CI run registered (id={baseline_run_id})")
+            break
 
     # Inject broken files
+    t_inject = utc_now()
     for repo_path, local_path in scenario.broken_files.items():
         with open(local_path) as f:
             broken_content = f.read()
@@ -499,8 +523,8 @@ def heal_scenario(scenario: Scenario, run_index: int) -> list[RunResult]:
                   f"[experiment] inject regression: {scenario.id}", branch)
         print(f"  ✓ Injected: {repo_path}")
 
-    # Wait for CI to fail — only accept runs started after injection
-    conclusion, ci_logs = wait_for_ci(branch, not_before=t_inject)
+    # Wait for CI to fail — only accept runs with ID > baseline_run_id (= triggered by injection)
+    conclusion, ci_logs = wait_for_ci(branch, not_before=t_inject, after_run_id=baseline_run_id)
     last_run_id = get_latest_run_id(branch)
     if conclusion == "success":
         print("  ⚠  CI passed with broken files — check scenario definition")
