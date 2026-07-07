@@ -259,13 +259,15 @@ def localize_failure(ci_log: str) -> tuple[str, list[str]]:
         failure_type = "configurational"
         files.add("requirements.txt")
 
-    # ── Architectural: ImportError / circular import / F4xx as flake8 code ──
-    # "F401" is checked as a flake8 code with file path (src/x.py:L:C: F4...)
-    # NOT as a plain substring — prevents false positives from "# noqa: F401"
-    # comments appearing in pytest --tb=long output.
+    # ── Architectural: ImportError / F4xx flake8 code ────────────────────────
+    # "circular import" is intentionally NOT in this list: it appears in the
+    # CI log header "=== JOB: Architecture Check (circular imports) ===" for
+    # EVERY scenario where lint passes, which would misclassify syntactic and
+    # functional failures as architectural.
+    # Actual circular import errors always produce "ImportError", "cannot import
+    # name", or "partially initialized module" — so "circular import" is redundant.
     elif (any(msg in ci_log for msg in [
         "ImportError",
-        "circular import",
         "cannot import name",
         "partially initialized module",
     ]) or re.search(r'src/[\w/]+\.py:\d+:\d+: F4', ci_log)):
@@ -349,14 +351,12 @@ _TYPE_HINTS: dict[str, str] = {
         "Do NOT invent or guess version numbers."
     ),
     "architectural": (
-        "The broken file contains a circular import line such as "
-        "'from src.services.X import Y'. "
-        "DELETE that import line completely — do not replace it with anything. "
-        "The fixed file must start directly with 'class ...' and contain "
-        "ZERO import statements from src.services. "
-        "WRONG: any remaining 'from src.services...' line — causes F401 and fails CI. "
-        "CORRECT: the import line is gone; class definition comes first. "
-        "Do NOT invent or reference files not listed under FILES TO FIX."
+        "DELETE every 'from src.services...' import line from each broken file. "
+        "The fixed files must contain ZERO import statements from src.services. "
+        "WRONG: leaving 'from src.services.X import Y' in the file. "
+        "CORRECT: that line is deleted — the file starts directly with 'class ...'. "
+        "CRITICAL: Any remaining src.services import causes F401 and fails CI. "
+        "Do NOT invent or reference files that are not listed under FILES TO FIX."
     ),
 }
 
@@ -736,7 +736,7 @@ def get_scenarios() -> list[Scenario]:
 
 # ── Experiment runner ─────────────────────────────────────────────────────────
 
-def run_experiment(runs_per_scenario: int = 3):
+def run_experiment(runs_per_scenario: int = 10):
     if not GITHUB_TOKEN:
         raise SystemExit("ERROR: Set GITHUB_TOKEN environment variable first.")
     if not ollama_available():
