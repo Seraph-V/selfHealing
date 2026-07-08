@@ -30,6 +30,7 @@ Thumbs.db
 *.bak
 *.tmp
 *.swp
+*.pdf
 *~
 
 # IDE and editor generated files

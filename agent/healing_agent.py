@@ -41,6 +41,7 @@ class Scenario:
     id: str
     description: str
     broken_files: dict[str, str]        # repo_path → local broken file (injection only)
+    context_files: list[str] = field(default_factory=list)  # repo_paths shown read-only to the LLM
     ground_truth_type: str = ""         # for accuracy metrics only — agent must NOT use this
 
 
@@ -573,6 +574,11 @@ def heal_scenario(scenario: Scenario, run_index: int) -> list[RunResult]:
         return results
 
     context_contents: dict[str, str] = {}
+    for repo_path in scenario.context_files:
+        try:
+            context_contents[repo_path] = get_file_content(repo_path, branch)
+        except RuntimeError:
+            print(f"  ⚠  Could not read context file {repo_path}")
 
     # Attempt fixes
     for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -731,6 +737,20 @@ def get_scenarios() -> list[Scenario]:
             },
             ground_truth_type="architectural",
         ),
+        Scenario(
+            id="architectural_regression_2",
+            description=(
+                "Circular import that is functionally load-bearing (cross-service "
+                "order/user lookups) — deleting the import breaks behaviour; the "
+                "correct fix routes through the shared src.data layer instead."
+            ),
+            broken_files={
+                "src/services/user.py":  f"{base}/architectural_regression_2_user.py",
+                "src/services/order.py": f"{base}/architectural_regression_2_order.py",
+            },
+            context_files=["src/data.py"],
+            ground_truth_type="architectural",
+        ),
     ]
 
 
@@ -795,4 +815,5 @@ def run_experiment(runs_per_scenario: int = 10):
 
 
 if __name__ == "__main__":
-    run_experiment(runs_per_scenario=10)
+    run_experiment(runs_per_scenario=3)
+

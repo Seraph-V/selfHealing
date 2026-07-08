@@ -100,6 +100,19 @@ class TestArchitectural:
         assert u.get_name(1) == "Alice"
         assert o.get_orders_for(1) == ["order_101", "order_102"]
 
+    def test_user_service_order_count(self):
+        """Requires cross-domain data (order count) via src.data, not OrderService."""
+        from src.services.user import UserService
+        assert UserService().get_order_count(1) == 2
+        assert UserService().get_order_count(2) == 0
+
+    def test_order_service_summary_includes_name(self):
+        """Requires cross-domain data (user name) via src.data, not UserService."""
+        from src.services.order import OrderService
+        summary = OrderService().get_order_summary(1)
+        assert "Alice" in summary
+        assert "2" in summary
+
     def test_no_cross_service_dependency(self):
         """Verify services only depend on src.data, not each other."""
         import importlib
