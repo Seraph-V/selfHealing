@@ -55,6 +55,11 @@ class TestFunctional:
         with pytest.raises(ValueError, match="Division by zero"):
             divide(5, 0)
 
+    def test_average_rounds_correctly(self):
+        """Requires safe_round() from src.utils — indirect cross-file dependency."""
+        from src.calculator import average
+        assert average([1, 2, 5]) == 2.67
+
 
 # ── Configurational Regression Tests ─────────────────────────────────────────
 
@@ -154,3 +159,8 @@ class TestUtils:
     def test_clamp_above_max(self):
         from src.utils import clamp
         assert clamp(15, 0, 10) == 10
+
+    def test_load_config_parses_yaml(self):
+        """Requires the PyYAML dependency to be installed."""
+        from src.utils import load_config
+        assert load_config("key: value") == {"key": "value"}

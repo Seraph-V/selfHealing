@@ -24,7 +24,10 @@ import requests
 GITHUB_TOKEN  = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_OWNER  = "Seraph-V"
 GITHUB_REPO   = "selfHealing"
-BASE_BRANCH   = "main"
+# Defaults to "main" so a forgotten override never points experiments at the
+# wrong branch. Set EXPERIMENT_BASE_BRANCH to target a different branch,
+# e.g. a working branch for larger, not-yet-validated changes.
+BASE_BRANCH   = os.environ.get("EXPERIMENT_BASE_BRANCH", "main")
 
 OLLAMA_URL    = "http://localhost:11434"
 OLLAMA_MODEL  = "codellama:7b"
@@ -251,11 +254,18 @@ def localize_failure(ci_log: str) -> tuple[str, list[str]]:
     failure_type = "unknown"
 
     # ── Configurational (pip) ─────────────────────────────────────
+    # "ModuleNotFoundError" is included here (not just pip-resolution
+    # messages): a genuinely missing dependency doesn't fail `pip install`
+    # (nothing wrong with requirements.txt syntactically) — it only
+    # surfaces later as a runtime import error. Without this, such a
+    # failure would fall through to the generic "FAILED" functional
+    # trigger and misclassify the missing dependency as a logic error.
     if any(msg in ci_log for msg in [
         "No matching distribution",
         "ResolutionImpossible",
         "Could not find a version",
         "not find a version that satisfies",
+        "ModuleNotFoundError",
     ]):
         failure_type = "configurational"
         files.add("requirements.txt")
@@ -302,23 +312,35 @@ def localize_failure(ci_log: str) -> tuple[str, list[str]]:
 
 def localize_functional_source(
     ci_log: str,
-    test_files: list[str],
+    known_files: list[str],
+    known_contents: dict[str, str],
 ) -> list[str]:
     """
-    Zweiter LLM-Call nur für functional regression:
-    Leitet Source-Dateipfad aus Test-Dateiname und Log ab.
-    Wird nur aufgerufen wenn localize_failure() "functional" zurückgibt
-    und die direkte Zuordnung (test_X.py → src/X.py) fehlschlägt.
+    LLM call for functional-regression file localization. Always invoked
+    (in addition to the deterministic regex match in localize_failure()),
+    so the LLM can confirm or extend the file set — e.g. propose a shared
+    helper module that the regex-only extraction cannot see, since it only
+    matches the import statement literally present in the failing test's
+    own source code, not the internal call graph of the file it imports.
     """
+    context_block = "\n\n".join(
+        f"### {path}\n```\n{content}\n```"
+        for path, content in known_contents.items()
+    ) or "(none identified yet)"
+
     prompt = f"""A CI pipeline failed with the following pytest output:
 ---
 {ci_log[:1500]}
 ---
 
-The failing test files are: {test_files}
+Source file(s) already identified as directly involved:
+{context_block}
 
-Which source file(s) in the src/ directory are most likely
-responsible for these test failures?
+Based on the failing test and the file(s) shown above (if any), list ALL
+source files under src/ that need to be fixed to resolve this failure.
+Include the file(s) already shown above if they are still relevant, and add
+any additional file (e.g. a shared helper module imported by the code
+above) that also needs to change to make the test pass.
 
 Respond with ONLY a JSON array of file paths, no other text:
 ["src/example.py"]"""
@@ -330,9 +352,10 @@ Respond with ONLY a JSON array of file paths, no other text:
                  .removeprefix("```")
                  .removesuffix("```")
                  .strip())
-        return json.loads(clean)
+        result = json.loads(clean)
+        return result if isinstance(result, list) and result else known_files
     except Exception:
-        return test_files
+        return known_files
 
 
 # ── Prompt builder ────────────────────────────────────────────────────────────
@@ -542,19 +565,27 @@ def heal_scenario(scenario: Scenario, run_index: int) -> list[RunResult]:
     print(f"  → Failure type detected: {detected_type} {match_sym}{gt_label}")
     print(f"  → Affected files: {affected_files}")
 
-    # Sonderfall Functional: zweiter LLM-Call wenn direkte Zuordnung fehlschlägt
+    # Sonderfall Functional: LLM-Call findet immer statt, um die per Regex
+    # gefundene Datei zu bestätigen oder um weitere Dateien zu ergänzen
+    # (z. B. eine Hilfsdatei, die von der gefundenen Datei importiert wird).
     if failure_type == "functional":
-        test_files = affected_files
-        source_files = []
-        for tf in test_files:
+        candidates = []
+        for tf in affected_files:
             candidate = tf.replace("tests/test_", "src/")
             if get_file_sha(candidate, branch):
-                source_files.append(candidate)
-        if not source_files:
-            print("  Calling LLM for functional source localization...",
-                  end="", flush=True)
-            source_files = localize_functional_source(ci_logs, test_files)
-            print(f" {source_files}")
+                candidates.append(candidate)
+
+        known_contents = {}
+        for path in candidates:
+            try:
+                known_contents[path] = get_file_content(path, branch)
+            except RuntimeError:
+                pass
+
+        print("  Calling LLM for functional source localization...",
+              end="", flush=True)
+        source_files = localize_functional_source(ci_logs, candidates, known_contents)
+        print(f" {source_files}")
         affected_files = source_files
 
     if not affected_files:
@@ -705,6 +736,16 @@ def get_scenarios() -> list[Scenario]:
             ground_truth_type="functional",
         ),
         Scenario(
+            id="functional_regression_3",
+            description=(
+                "average() in calculator.py fails because safe_round() in "
+                "utils.py rounds off by one digit — the buggy file is not the "
+                "one directly imported by the failing test."
+            ),
+            broken_files={"src/utils.py": f"{base}/functional_regression_3.py"},
+            ground_truth_type="functional",
+        ),
+        Scenario(
             id="syntactic_regression",
             description="PEP8 violations in utils.py",
             broken_files={"src/utils.py": f"{base}/syntactic_regression.py"},
@@ -717,6 +758,16 @@ def get_scenarios() -> list[Scenario]:
             ground_truth_type="syntactic",
         ),
         Scenario(
+            id="syntactic_regression_3",
+            description=(
+                "Three simultaneous, independent flake8 violations in data.py "
+                "(E711 + F841 + E501) — tests whether the agent fixes all of "
+                "them in one pass without missing one or over-fixing."
+            ),
+            broken_files={"src/data.py": f"{base}/syntactic_regression_3.py"},
+            ground_truth_type="syntactic",
+        ),
+        Scenario(
             id="configurational_regression",
             description="Nonexistent package version in requirements.txt",
             broken_files={"requirements.txt": f"{base}/configurational_regression.txt"},
@@ -726,6 +777,16 @@ def get_scenarios() -> list[Scenario]:
             id="configurational_regression_2",
             description="Nonexistent pytest version in requirements.txt",
             broken_files={"requirements.txt": f"{base}/configurational_regression_2.txt"},
+            ground_truth_type="configurational",
+        ),
+        Scenario(
+            id="configurational_regression_3",
+            description=(
+                "PyYAML is missing entirely from requirements.txt (not a "
+                "wrong version pin) — pip install succeeds, the failure "
+                "only appears as a ModuleNotFoundError at test time."
+            ),
+            broken_files={"requirements.txt": f"{base}/configurational_regression_3.txt"},
             ground_truth_type="configurational",
         ),
         Scenario(
@@ -815,5 +876,5 @@ def run_experiment(runs_per_scenario: int = 10):
 
 
 if __name__ == "__main__":
-    run_experiment(runs_per_scenario=3)
+    run_experiment(runs_per_scenario=2)
 
