@@ -30,7 +30,7 @@ GITHUB_REPO   = "selfHealing"
 BASE_BRANCH   = os.environ.get("EXPERIMENT_BASE_BRANCH", "main")
 
 OLLAMA_URL    = "http://localhost:11434"
-OLLAMA_MODEL  = "codellama:7b"
+OLLAMA_MODEL  = "qwen2.5-coder:14b "
 OLLAMA_TEMP   = 0.2
 
 MAX_ATTEMPTS  = 3
@@ -363,23 +363,43 @@ Respond with ONLY a JSON array of file paths, no other text:
 _TYPE_HINTS: dict[str, str] = {
     "functional": (
         "The tests are correct — the source code has a logic error. "
-        "Study each failed assertion: the left side is the actual (wrong) result, "
-        "the right side is the expected (correct) result. "
-        "Fix the implementation to produce the expected values. "
-        "Pay close attention to operator order, min/max nesting, and arithmetic signs."
+        "The CI log above shows the failing assertion(s): the actual/left side is what "
+        "the current (buggy) code produces, the expected/right side is what it should "
+        "produce. Use that diff, not assumptions, to find the bug — compare actual vs. "
+        "expected for every failing case to infer exactly which operator, condition, or "
+        "computation is wrong (this can be anything: operator choice, comparison "
+        "direction, argument order, nesting — the log tells you which, don't guess). "
+        "Fix the implementation so it produces the expected value for every case shown "
+        "in the log, not just the first one."
     ),
     "configurational": (
-        "For requirements.txt: only use well-known stable PyPI versions. "
-        "Safe choices: requests → 2.28.0 or 2.31.0; pytest → 7.4.3 or 7.2.0; flake8 → 6.1.0. "
-        "IMPORTANT: pytest 6.x is NOT compatible with this project (requires pytest 7+). "
-        "Do NOT invent or guess version numbers."
+        "The CI log above names the exact dependency problem — look for 'Could not "
+        "find a version', 'No matching distribution', 'ResolutionImpossible', or "
+        "'ModuleNotFoundError'. "
+        "If pip's error lists available versions (often after 'from versions:'), the "
+        "fix MUST use one of those exact listed versions — do not invent or guess a "
+        "version number that does not appear in the log. "
+        "If the error is a ModuleNotFoundError instead (the package is missing from "
+        "requirements.txt entirely, not just pinned wrong), add an entry for it using a "
+        "well-known, stable release; note the import name in the error (e.g. 'yaml') is "
+        "not always the same as the PyPI package name (e.g. 'PyYAML'). "
+        "Only change or add the dependency the CI log actually names — leave every "
+        "other line in requirements.txt untouched."
     ),
     "architectural": (
-        "DELETE every 'from src.services...' import line from each broken file. "
-        "The fixed files must contain ZERO import statements from src.services. "
-        "WRONG: leaving 'from src.services.X import Y' in the file. "
-        "CORRECT: that line is deleted — the file starts directly with 'class ...'. "
-        "CRITICAL: Any remaining src.services import causes F401 and fails CI. "
+        "The CI log above names the exact cause of the circular dependency — look for "
+        "'ImportError', 'cannot import name', 'partially initialized module', or an "
+        "'imported but unused' (F401) warning; that message identifies which specific "
+        "module each broken file must stop importing from. DELETE only the import "
+        "line(s) that import from that module. "
+        "Every OTHER import in the file is unrelated to the circular dependency: before "
+        "deleting or changing any import line, check whether the names it imports are "
+        "still referenced anywhere in the file's code. If they are, that import line "
+        "MUST be kept exactly as-is. "
+        "CRITICAL: leaving in the import line named by the CI error reproduces the same "
+        "failure and fails CI. "
+        "CRITICAL: deleting a still-used import that the CI log did NOT flag causes "
+        "NameError and also fails CI. "
         "Do NOT invent or reference files that are not listed under FILES TO FIX."
     ),
 }
@@ -565,9 +585,11 @@ def heal_scenario(scenario: Scenario, run_index: int) -> list[RunResult]:
     print(f"  → Failure type detected: {detected_type} {match_sym}{gt_label}")
     print(f"  → Affected files: {affected_files}")
 
-    # Sonderfall Functional: LLM-Call findet immer statt, um die per Regex
-    # gefundene Datei zu bestätigen oder um weitere Dateien zu ergänzen
-    # (z. B. eine Hilfsdatei, die von der gefundenen Datei importiert wird).
+    # Sonderfall Functional: zunächst deterministisch ergänzen, dann per LLM
+    # bestätigen/erweitern. Die Regex in localize_failure() sieht nur das
+    # Import-Statement im Testcode selbst, nicht den internen Call-Graph der
+    # gefundenen Datei — ein Bug in einer importierten Hilfsdatei (z. B.
+    # utils.py, von calculator.py importiert) wäre sonst unsichtbar.
     if failure_type == "functional":
         candidates = []
         for tf in affected_files:
@@ -582,11 +604,27 @@ def heal_scenario(scenario: Scenario, run_index: int) -> list[RunResult]:
             except RuntimeError:
                 pass
 
+        # Deterministische Ergänzung: jedes von einer bereits bekannten
+        # Datei importierte src/-Modul wird automatisch als Kandidat
+        # aufgenommen — verlässt sich nicht auf LLM-Schlussfolgerung.
+        for m in re.findall(r'from (src(?:\.\w+)+) import',
+                             "\n".join(known_contents.values())):
+            extra_path = m.replace(".", "/") + ".py"
+            if extra_path not in candidates and get_file_sha(extra_path, branch):
+                try:
+                    known_contents[extra_path] = get_file_content(extra_path, branch)
+                    candidates.append(extra_path)
+                except RuntimeError:
+                    pass
+
         print("  Calling LLM for functional source localization...",
               end="", flush=True)
-        source_files = localize_functional_source(ci_logs, candidates, known_contents)
-        print(f" {source_files}")
-        affected_files = source_files
+        llm_files = localize_functional_source(ci_logs, candidates, known_contents)
+        print(f" {llm_files}")
+        # Vereinigung statt Ersetzung: der LLM-Call kann Kandidaten nur
+        # ergänzen, nie einen deterministisch gefundenen stillschweigend
+        # verwerfen.
+        affected_files = list(dict.fromkeys(candidates + llm_files))
 
     if not affected_files:
         print("  ⚠  No affected files identified — skipping")
@@ -722,6 +760,7 @@ def heal_scenario(scenario: Scenario, run_index: int) -> list[RunResult]:
 
 def get_scenarios() -> list[Scenario]:
     base = "scenarios"
+
     return [
         Scenario(
             id="functional_regression",
@@ -813,8 +852,114 @@ def get_scenarios() -> list[Scenario]:
             ground_truth_type="architectural",
         ),
     ]
+    '''   
+    return [
+        Scenario(
+            id="functional_regression_3",
+            description=(
+                "average() in calculator.py fails because safe_round() in "
+                "utils.py rounds off by one digit — the buggy file is not the "
+                "one directly imported by the failing test."
+            ),
+            broken_files={"src/utils.py": f"{base}/functional_regression_3.py"},
+            ground_truth_type="functional",
+        ),
+        Scenario(
+            id="syntactic_regression_3",
+            description=(
+                "Three simultaneous, independent flake8 violations in data.py "
+                "(E711 + F841 + E501) — tests whether the agent fixes all of "
+                "them in one pass without missing one or over-fixing."
+            ),
+            broken_files={"src/data.py": f"{base}/syntactic_regression_3.py"},
+            ground_truth_type="syntactic",
+        ),
+        Scenario(
+            id="configurational_regression_3",
+            description=(
+                "PyYAML is missing entirely from requirements.txt (not a "
+                "wrong version pin) — pip install succeeds, the failure "
+                "only appears as a ModuleNotFoundError at test time."
+            ),
+            broken_files={"requirements.txt": f"{base}/configurational_regression_3.txt"},
+            ground_truth_type="configurational",
+        ),
+        Scenario(
+            id="architectural_regression",
+            description="Circular import between user.py and order.py",
+            broken_files={
+                "src/services/user.py":  f"{base}/architectural_regression_user.py",
+                "src/services/order.py": f"{base}/architectural_regression_order.py",
+            },
+            ground_truth_type="architectural",
+        ),
+        Scenario(
+            id="architectural_regression_2",
+            description=(
+                "Circular import that is functionally load-bearing (cross-service "
+                "order/user lookups) — deleting the import breaks behaviour; the "
+                "correct fix routes through the shared src.data layer instead."
+            ),
+            broken_files={
+                "src/services/user.py":  f"{base}/architectural_regression_2_user.py",
+                "src/services/order.py": f"{base}/architectural_regression_2_order.py",
+            },
+            context_files=["src/data.py"],
+            ground_truth_type="architectural",
+        ),
+    ]
 
+    return [
+        Scenario(
+            id="functional_regression",
+            description="Wrong arithmetic operators in calculator.py",
+            broken_files={"src/calculator.py": f"{base}/functional_regression.py"},
+            ground_truth_type="functional",
+        ),
+        Scenario(
+            id="functional_regression_2",
+            description="Inverted clamp() logic in utils.py",
+            broken_files={"src/utils.py": f"{base}/functional_regression_2.py"},
+            ground_truth_type="functional",
+        ),
+        Scenario(
+            id="functional_regression_3",
+            description=(
+                "average() in calculator.py fails because safe_round() in "
+                "utils.py rounds off by one digit — the buggy file is not the "
+                "one directly imported by the failing test."
+            ),
+            broken_files={"src/utils.py": f"{base}/functional_regression_3.py"},
+            ground_truth_type="functional",
+        ),
+    ]
 
+    return[
+        Scenario(
+            id="architectural_regression",
+            description="Circular import between user.py and order.py",
+            broken_files={
+                "src/services/user.py":  f"{base}/architectural_regression_user.py",
+                "src/services/order.py": f"{base}/architectural_regression_order.py",
+            },
+            ground_truth_type="architectural",
+        ),
+        Scenario(
+            id="architectural_regression_2",
+            description=(
+                "Circular import that is functionally load-bearing (cross-service "
+                "order/user lookups) — deleting the import breaks behaviour; the "
+                "correct fix routes through the shared src.data layer instead."
+            ),
+            broken_files={
+                "src/services/user.py":  f"{base}/architectural_regression_2_user.py",
+                "src/services/order.py": f"{base}/architectural_regression_2_order.py",
+            },
+            context_files=["src/data.py"],
+            ground_truth_type="architectural",
+        ),
+    ]
+'''
 # ── Experiment runner ─────────────────────────────────────────────────────────
 
 def run_experiment(runs_per_scenario: int = 10):
@@ -876,5 +1021,5 @@ def run_experiment(runs_per_scenario: int = 10):
 
 
 if __name__ == "__main__":
-    run_experiment(runs_per_scenario=2)
+    run_experiment(runs_per_scenario=3)
 
