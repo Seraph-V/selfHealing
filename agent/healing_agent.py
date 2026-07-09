@@ -1021,5 +1021,5 @@ def run_experiment(runs_per_scenario: int = 10):
 
 
 if __name__ == "__main__":
-    run_experiment(runs_per_scenario=3)
+    run_experiment(runs_per_scenario=10)
 
