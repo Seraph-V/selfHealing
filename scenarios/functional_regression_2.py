@@ -4,6 +4,8 @@
 # Replaces src/utils.py to trigger CI failure.
 import os
 
+import yaml
+
 
 def get_env(key, default=None):
     value = os.environ.get(key, default)
@@ -14,3 +16,11 @@ def get_env(key, default=None):
 
 def clamp(value, lo, hi):
     return min(lo, max(value, hi))
+
+
+def safe_round(value, digits=2):
+    return round(value, digits)
+
+
+def load_config(text):
+    return yaml.safe_load(text)

@@ -2,6 +2,7 @@
 Calculator module — correct (green) implementation.
 The CI pipeline should pass with this file.
 """
+from src.utils import safe_round
 
 
 def add(a: float, b: float) -> float:
@@ -20,3 +21,7 @@ def divide(a: float, b: float) -> float:
     if b == 0:
         raise ValueError("Division by zero")
     return a / b
+
+
+def average(numbers: list) -> float:
+    return safe_round(sum(numbers) / len(numbers))

@@ -14,7 +14,7 @@ import os
 import re
 import time
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Optional
 
 import requests
@@ -24,10 +24,13 @@ import requests
 GITHUB_TOKEN  = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_OWNER  = "Seraph-V"
 GITHUB_REPO   = "selfHealing"
-BASE_BRANCH   = "main"
+# Defaults to "main" so a forgotten override never points experiments at the
+# wrong branch. Set EXPERIMENT_BASE_BRANCH to target a different branch,
+# e.g. a working branch for larger, not-yet-validated changes.
+BASE_BRANCH   = os.environ.get("EXPERIMENT_BASE_BRANCH", "main")
 
 OLLAMA_URL    = "http://localhost:11434"
-OLLAMA_MODEL  = "codellama:7b"
+OLLAMA_MODEL  = "qwen2.5-coder:14b"
 OLLAMA_TEMP   = 0.2
 
 MAX_ATTEMPTS  = 3
@@ -53,7 +56,6 @@ class RunResult:
     patch_generated: bool = False
     patch_applied: bool   = False
     ci_green: bool        = False
-    hallucination: bool   = False
     time_to_recovery: Optional[float] = None
     llm_raw: str = ""
     patch_diff: str = ""
@@ -123,7 +125,7 @@ def get_file_content(repo_path: str, branch: str) -> str:
 
 
 def get_latest_run_id(branch: str) -> Optional[int]:
-    """Gibt die ID des aktuell neuesten CI-Runs auf diesem Branch zurück."""
+    """Returns the ID of the currently latest CI run on this branch."""
     runs = gh("GET", "/actions/runs", params={"branch": branch, "per_page": 1}).get("workflow_runs", [])
     return runs[0]["id"] if runs else None
 
@@ -133,11 +135,18 @@ def utc_now() -> datetime:
 
 
 def wait_for_ci(branch: str, after_run_id: Optional[int] = None,
-                not_before: Optional[datetime] = None) -> tuple[str, str]:
+                not_before: Optional[datetime] = None
+                ) -> tuple[str, str, Optional[datetime]]:
     """
-    Wartet auf einen abgeschlossenen CI-Run auf dem Branch.
-    not_before: Nur Runs akzeptieren, die nach diesem UTC-Zeitpunkt gestartet wurden.
-    after_run_id: Fallback-Filter per Run-ID (Legacy-Support).
+    Waits for a completed CI run on the branch.
+    not_before: Only accept runs that started after this UTC timestamp.
+    after_run_id: Fallback filter by run ID (legacy support).
+
+    Returns (conclusion, ci_logs, completed_at). completed_at is GitHub's own
+    'updated_at' timestamp for the completed run, not the local time.time()
+    at which our poll happened to observe it — this avoids inflating TTR by
+    up to CI_POLL_SEC seconds of polling-interval jitter plus local API
+    round-trip latency.
     """
     print(f"  ⏳ Waiting for CI on '{branch}'...", end="", flush=True)
     deadline = time.time() + CI_TIMEOUT
@@ -153,9 +162,9 @@ def wait_for_ci(branch: str, after_run_id: Optional[int] = None,
             print(".", end="", flush=True)
             continue
 
-        run = runs[0]  # neuester Run
+        run = runs[0]  # most recent run
 
-        # Timestamp-Filter: überspringe Runs, die vor unserem Push-Zeitpunkt gestartet sind
+        # Timestamp filter: skip runs that started before our push
         if not_before is not None:
             run_created = datetime.fromisoformat(
                 run["created_at"].replace("Z", "+00:00")
@@ -164,19 +173,24 @@ def wait_for_ci(branch: str, after_run_id: Optional[int] = None,
                 print(".", end="", flush=True)
                 continue
 
-        # Legacy-Filter per Run-ID
+        # Legacy filter by run ID
         if after_run_id and run["id"] <= after_run_id:
             print(".", end="", flush=True)
             continue
 
         if run["status"] == "completed":
             print(f" {run['conclusion']}")
-            return run["conclusion"], fetch_ci_logs(run["id"])
+            completed_at = None
+            if run.get("updated_at"):
+                completed_at = datetime.fromisoformat(
+                    run["updated_at"].replace("Z", "+00:00")
+                )
+            return run["conclusion"], fetch_ci_logs(run["id"]), completed_at
 
         print(".", end="", flush=True)
 
     print(" TIMEOUT")
-    return "timeout", ""
+    return "timeout", "", None
 
 
 def gh_raw_text(path: str) -> str:
@@ -240,7 +254,7 @@ def ollama_generate(prompt: str) -> str:
 
 def localize_failure(ci_log: str) -> tuple[str, list[str]]:
     """
-    Extrahiert Fehlertyp und betroffene Dateipfade aus dem CI-Log.
+    Extracts the failure type and affected file paths from the CI log.
 
     Returns:
         tuple[failure_type, list[affected_file_paths]]
@@ -251,11 +265,18 @@ def localize_failure(ci_log: str) -> tuple[str, list[str]]:
     failure_type = "unknown"
 
     # ── Configurational (pip) ─────────────────────────────────────
+    # "ModuleNotFoundError" is included here (not just pip-resolution
+    # messages): a genuinely missing dependency doesn't fail `pip install`
+    # (nothing wrong with requirements.txt syntactically) — it only
+    # surfaces later as a runtime import error. Without this, such a
+    # failure would fall through to the generic "FAILED" functional
+    # trigger and misclassify the missing dependency as a logic error.
     if any(msg in ci_log for msg in [
         "No matching distribution",
         "ResolutionImpossible",
         "Could not find a version",
         "not find a version that satisfies",
+        "ModuleNotFoundError",
     ]):
         failure_type = "configurational"
         files.add("requirements.txt")
@@ -302,23 +323,35 @@ def localize_failure(ci_log: str) -> tuple[str, list[str]]:
 
 def localize_functional_source(
     ci_log: str,
-    test_files: list[str],
+    known_files: list[str],
+    known_contents: dict[str, str],
 ) -> list[str]:
     """
-    Zweiter LLM-Call nur für functional regression:
-    Leitet Source-Dateipfad aus Test-Dateiname und Log ab.
-    Wird nur aufgerufen wenn localize_failure() "functional" zurückgibt
-    und die direkte Zuordnung (test_X.py → src/X.py) fehlschlägt.
+    LLM call for functional-regression file localization. Always invoked
+    (in addition to the deterministic regex match in localize_failure()),
+    so the LLM can confirm or extend the file set — e.g. propose a shared
+    helper module that the regex-only extraction cannot see, since it only
+    matches the import statement literally present in the failing test's
+    own source code, not the internal call graph of the file it imports.
     """
+    context_block = "\n\n".join(
+        f"### {path}\n```\n{content}\n```"
+        for path, content in known_contents.items()
+    ) or "(none identified yet)"
+
     prompt = f"""A CI pipeline failed with the following pytest output:
 ---
 {ci_log[:1500]}
 ---
 
-The failing test files are: {test_files}
+Source file(s) already identified as directly involved:
+{context_block}
 
-Which source file(s) in the src/ directory are most likely
-responsible for these test failures?
+Based on the failing test and the file(s) shown above (if any), list ALL
+source files under src/ that need to be fixed to resolve this failure.
+Include the file(s) already shown above if they are still relevant, and add
+any additional file (e.g. a shared helper module imported by the code
+above) that also needs to change to make the test pass.
 
 Respond with ONLY a JSON array of file paths, no other text:
 ["src/example.py"]"""
@@ -330,9 +363,10 @@ Respond with ONLY a JSON array of file paths, no other text:
                  .removeprefix("```")
                  .removesuffix("```")
                  .strip())
-        return json.loads(clean)
+        result = json.loads(clean)
+        return result if isinstance(result, list) and result else known_files
     except Exception:
-        return test_files
+        return known_files
 
 
 # ── Prompt builder ────────────────────────────────────────────────────────────
@@ -340,23 +374,43 @@ Respond with ONLY a JSON array of file paths, no other text:
 _TYPE_HINTS: dict[str, str] = {
     "functional": (
         "The tests are correct — the source code has a logic error. "
-        "Study each failed assertion: the left side is the actual (wrong) result, "
-        "the right side is the expected (correct) result. "
-        "Fix the implementation to produce the expected values. "
-        "Pay close attention to operator order, min/max nesting, and arithmetic signs."
+        "The CI log above shows the failing assertion(s): the actual/left side is what "
+        "the current (buggy) code produces, the expected/right side is what it should "
+        "produce. Use that diff, not assumptions, to find the bug — compare actual vs. "
+        "expected for every failing case to infer exactly which operator, condition, or "
+        "computation is wrong (this can be anything: operator choice, comparison "
+        "direction, argument order, nesting — the log tells you which, don't guess). "
+        "Fix the implementation so it produces the expected value for every case shown "
+        "in the log, not just the first one."
     ),
     "configurational": (
-        "For requirements.txt: only use well-known stable PyPI versions. "
-        "Safe choices: requests → 2.28.0 or 2.31.0; pytest → 7.4.3 or 7.2.0; flake8 → 6.1.0. "
-        "IMPORTANT: pytest 6.x is NOT compatible with this project (requires pytest 7+). "
-        "Do NOT invent or guess version numbers."
+        "The CI log above names the exact dependency problem — look for 'Could not "
+        "find a version', 'No matching distribution', 'ResolutionImpossible', or "
+        "'ModuleNotFoundError'. "
+        "If pip's error lists available versions (often after 'from versions:'), the "
+        "fix MUST use one of those exact listed versions — do not invent or guess a "
+        "version number that does not appear in the log. "
+        "If the error is a ModuleNotFoundError instead (the package is missing from "
+        "requirements.txt entirely, not just pinned wrong), add an entry for it using a "
+        "well-known, stable release; note the import name in the error (e.g. 'yaml') is "
+        "not always the same as the PyPI package name (e.g. 'PyYAML'). "
+        "Only change or add the dependency the CI log actually names — leave every "
+        "other line in requirements.txt untouched."
     ),
     "architectural": (
-        "DELETE every 'from src.services...' import line from each broken file. "
-        "The fixed files must contain ZERO import statements from src.services. "
-        "WRONG: leaving 'from src.services.X import Y' in the file. "
-        "CORRECT: that line is deleted — the file starts directly with 'class ...'. "
-        "CRITICAL: Any remaining src.services import causes F401 and fails CI. "
+        "The CI log above names the exact cause of the circular dependency — look for "
+        "'ImportError', 'cannot import name', 'partially initialized module', or an "
+        "'imported but unused' (F401) warning; that message identifies which specific "
+        "module each broken file must stop importing from. DELETE only the import "
+        "line(s) that import from that module. "
+        "Every OTHER import in the file is unrelated to the circular dependency: before "
+        "deleting or changing any import line, check whether the names it imports are "
+        "still referenced anywhere in the file's code. If they are, that import line "
+        "MUST be kept exactly as-is. "
+        "CRITICAL: leaving in the import line named by the CI error reproduces the same "
+        "failure and fails CI. "
+        "CRITICAL: deleting a still-used import that the CI log did NOT flag causes "
+        "NameError and also fails CI. "
         "Do NOT invent or reference files that are not listed under FILES TO FIX."
     ),
 }
@@ -403,7 +457,7 @@ INSTRUCTIONS:
 
 Respond in EXACTLY this format (no other text):
 
-{{"analysis": "<one sentence root-cause>", "confidence": <0.0-1.0>}}
+{{"analysis": "<one sentence root-cause>"}}
 ===FILE: <exact path>===
 <complete corrected file content>
 ===ENDFILE===
@@ -433,11 +487,8 @@ def parse_patch(raw: str) -> Optional[dict]:
 
     if patches:
         return {
-            "analysis":              metadata.get("analysis", ""),
-            "confidence":            metadata.get("confidence", 0.0),
-            "patches":               patches,
-            "hallucination_risk":    metadata.get("hallucination_risk", "unknown"),
-            "requires_human_review": metadata.get("requires_human_review", False),
+            "analysis": metadata.get("analysis", ""),
+            "patches":  patches,
         }
 
     # Fallback: standard JSON parse (catches cases where the model ignores format instructions)
@@ -455,7 +506,7 @@ def parse_patch(raw: str) -> Optional[dict]:
 
 
 def strip_code_fences(content: str) -> str:
-    """Entfernt führende/nachfolgende Markdown-Code-Fences aus dem Dateiinhalt."""
+    """Removes leading/trailing Markdown code fences from the file content."""
     lines = content.strip().splitlines()
     if lines and re.match(r'^```[\w]*$', lines[0].strip()):
         lines = lines[1:]
@@ -465,7 +516,7 @@ def strip_code_fences(content: str) -> str:
 
 
 def fix_blank_lines(content: str) -> str:
-    """Stellt sicher dass 2 Leerzeilen vor top-level def/class stehen (PEP8 E302)."""
+    """Ensures 2 blank lines precede top-level def/class (PEP8 E302)."""
     lines = content.split('\n')
     result = []
     for i, line in enumerate(lines):
@@ -525,15 +576,14 @@ def heal_scenario(scenario: Scenario, run_index: int) -> list[RunResult]:
         print(f"  ✓ Injected: {repo_path}")
 
     # Wait for CI to fail — only accept runs with ID > baseline_run_id (= triggered by injection)
-    conclusion, ci_logs = wait_for_ci(branch, not_before=t_inject, after_run_id=baseline_run_id)
-    last_run_id = get_latest_run_id(branch)
+    conclusion, ci_logs, _ = wait_for_ci(branch, not_before=t_inject, after_run_id=baseline_run_id)
     if conclusion == "success":
         print("  ⚠  CI passed with broken files — check scenario definition")
         return results
 
     print(f"  ✗ CI failed as expected")
 
-    # Dynamische Fault Localization aus CI-Log
+    # Dynamic fault localization from the CI log
     failure_type, affected_files = localize_failure(ci_logs)
     detected_type = failure_type
     gt = scenario.ground_truth_type
@@ -542,26 +592,50 @@ def heal_scenario(scenario: Scenario, run_index: int) -> list[RunResult]:
     print(f"  → Failure type detected: {detected_type} {match_sym}{gt_label}")
     print(f"  → Affected files: {affected_files}")
 
-    # Sonderfall Functional: zweiter LLM-Call wenn direkte Zuordnung fehlschlägt
+    # Functional special case: first extend the candidate set deterministically,
+    # then confirm/extend it via LLM. The regex in localize_failure() only sees
+    # the import statement literally present in the test code itself, not the
+    # internal call graph of the file it imports — a bug in an imported helper
+    # file (e.g. utils.py, imported by calculator.py) would otherwise be invisible.
     if failure_type == "functional":
-        test_files = affected_files
-        source_files = []
-        for tf in test_files:
+        candidates = []
+        for tf in affected_files:
             candidate = tf.replace("tests/test_", "src/")
             if get_file_sha(candidate, branch):
-                source_files.append(candidate)
-        if not source_files:
-            print("  Calling LLM for functional source localization...",
-                  end="", flush=True)
-            source_files = localize_functional_source(ci_logs, test_files)
-            print(f" {source_files}")
-        affected_files = source_files
+                candidates.append(candidate)
+
+        known_contents = {}
+        for path in candidates:
+            try:
+                known_contents[path] = get_file_content(path, branch)
+            except RuntimeError:
+                pass
+
+        # Deterministic extension: any src/ module imported by an already-known
+        # file is automatically added as a candidate — does not rely on LLM inference.
+        for m in re.findall(r'from (src(?:\.\w+)+) import',
+                             "\n".join(known_contents.values())):
+            extra_path = m.replace(".", "/") + ".py"
+            if extra_path not in candidates and get_file_sha(extra_path, branch):
+                try:
+                    known_contents[extra_path] = get_file_content(extra_path, branch)
+                    candidates.append(extra_path)
+                except RuntimeError:
+                    pass
+
+        print("  Calling LLM for functional source localization...",
+              end="", flush=True)
+        llm_files = localize_functional_source(ci_logs, candidates, known_contents)
+        print(f" {llm_files}")
+        # Union instead of replacement: the LLM call can only add candidates,
+        # never silently discard one that was found deterministically.
+        affected_files = list(dict.fromkeys(candidates + llm_files))
 
     if not affected_files:
         print("  ⚠  No affected files identified — skipping")
         return results
 
-    # Dateiinhalte vom Branch laden
+    # Load file contents from the branch
     broken_contents: dict[str, str] = {}
     for repo_path in affected_files:
         try:
@@ -611,7 +685,7 @@ def heal_scenario(scenario: Scenario, run_index: int) -> list[RunResult]:
             results.append(result)
             continue
 
-        print(f"  → {patch_data.get('analysis', 'N/A')}  (confidence={patch_data.get('confidence','?')})")
+        print(f"  → {patch_data.get('analysis', 'N/A')}")
 
         # Apply patches — full file replacement
         known        = set(affected_files)
@@ -619,7 +693,7 @@ def heal_scenario(scenario: Scenario, run_index: int) -> list[RunResult]:
         apply_ok     = True
         t_last_push  = utc_now()  # updated just before each push; final value = last push time
         patches_list = patch_data.get("patches", [])
-        for patch_idx, patch in enumerate(patches_list):
+        for patch in patches_list:
             repo_path     = patch.get("filename")
             fixed_content = patch.get("fixed_content", "")
 
@@ -634,8 +708,7 @@ def heal_scenario(scenario: Scenario, run_index: int) -> list[RunResult]:
                     print(f"  ~ Normalized path '{repo_path}' → '{normalized}'")
                     repo_path = normalized
                 else:
-                    result.hallucination = True
-                    result.error = f"Hallucination: unknown file '{repo_path}'"
+                    result.error = f"Unknown file path: '{repo_path}'"
                     print(f"  ⚠  {result.error}")
                     apply_ok = False
                     break
@@ -671,12 +744,16 @@ def heal_scenario(scenario: Scenario, run_index: int) -> list[RunResult]:
         result.patch_diff    = "\n".join(diff_lines)
 
         # Only accept the CI run triggered by the LAST push (not intermediate runs)
-        conclusion, ci_logs = wait_for_ci(branch, not_before=t_last_push)
-        last_run_id = get_latest_run_id(branch)
+        conclusion, ci_logs, completed_at = wait_for_ci(branch, not_before=t_last_push)
         result.ci_green = conclusion == "success"
 
         if result.ci_green:
-            result.time_to_recovery = time.time() - t_start
+            # Prefer GitHub's own completion timestamp over the local
+            # time.time() at which our poll happened to observe it —
+            # removes up to CI_POLL_SEC seconds of polling jitter and
+            # local API round-trip latency from the TTR measurement.
+            recovery_end = completed_at.timestamp() if completed_at else time.time()
+            result.time_to_recovery = recovery_end - t_start
             print(f"  ✅ Pipeline GREEN after {result.time_to_recovery:.1f}s")
             results.append(result)
             break
@@ -691,6 +768,7 @@ def heal_scenario(scenario: Scenario, run_index: int) -> list[RunResult]:
 
 def get_scenarios() -> list[Scenario]:
     base = "scenarios"
+
     return [
         Scenario(
             id="functional_regression",
@@ -702,6 +780,16 @@ def get_scenarios() -> list[Scenario]:
             id="functional_regression_2",
             description="Inverted clamp() logic in utils.py",
             broken_files={"src/utils.py": f"{base}/functional_regression_2.py"},
+            ground_truth_type="functional",
+        ),
+        Scenario(
+            id="functional_regression_3",
+            description=(
+                "average() in calculator.py fails because safe_round() in "
+                "utils.py rounds off by one digit — the buggy file is not the "
+                "one directly imported by the failing test."
+            ),
+            broken_files={"src/utils.py": f"{base}/functional_regression_3.py"},
             ground_truth_type="functional",
         ),
         Scenario(
@@ -717,6 +805,16 @@ def get_scenarios() -> list[Scenario]:
             ground_truth_type="syntactic",
         ),
         Scenario(
+            id="syntactic_regression_3",
+            description=(
+                "Three simultaneous, independent flake8 violations in data.py "
+                "(E711 + F841 + E501) — tests whether the agent fixes all of "
+                "them in one pass without missing one or over-fixing."
+            ),
+            broken_files={"src/data.py": f"{base}/syntactic_regression_3.py"},
+            ground_truth_type="syntactic",
+        ),
+        Scenario(
             id="configurational_regression",
             description="Nonexistent package version in requirements.txt",
             broken_files={"requirements.txt": f"{base}/configurational_regression.txt"},
@@ -726,6 +824,16 @@ def get_scenarios() -> list[Scenario]:
             id="configurational_regression_2",
             description="Nonexistent pytest version in requirements.txt",
             broken_files={"requirements.txt": f"{base}/configurational_regression_2.txt"},
+            ground_truth_type="configurational",
+        ),
+        Scenario(
+            id="configurational_regression_3",
+            description=(
+                "PyYAML is missing entirely from requirements.txt (not a "
+                "wrong version pin) — pip install succeeds, the failure "
+                "only appears as a ModuleNotFoundError at test time."
+            ),
+            broken_files={"requirements.txt": f"{base}/configurational_regression_3.txt"},
             ground_truth_type="configurational",
         ),
         Scenario(
@@ -780,7 +888,7 @@ def run_experiment(runs_per_scenario: int = 10):
     print(f"\n{'═'*60}")
     print("  RESULTS SUMMARY")
     print(f"{'─'*60}")
-    print(f"{'Scenario':<35} {'FSR':>5} {'VPR':>5} {'HR':>5} {'TTR':>7}")
+    print(f"{'Scenario':<35} {'FSR':>5} {'VPR':>5} {'TTR':>7}")
     print(f"{'─'*60}")
 
     for scenario in scenarios:
@@ -790,13 +898,12 @@ def run_experiment(runs_per_scenario: int = 10):
             continue
         fsr = sum(1 for r in s_res if r.ci_green) / runs_per_scenario
         vpr = sum(1 for r in s_res if r.patch_applied) / total
-        hr  = sum(1 for r in s_res if r.hallucination) / total
         ttr = [r.time_to_recovery for r in s_res if r.time_to_recovery]
         ttr_avg = f"{sum(ttr)/len(ttr):.0f}s" if ttr else "N/A"
-        print(f"{scenario.id:<35} {fsr:>4.0%}  {vpr:>4.0%}  {hr:>4.0%}  {ttr_avg:>6}")
+        print(f"{scenario.id:<35} {fsr:>4.0%}  {vpr:>4.0%}  {ttr_avg:>6}")
 
     print(f"{'─'*60}")
-    print("FSR | VPR | HR | TTR")
+    print("FSR | VPR | TTR")
 
     # Classification accuracy across all runs
     type_map = {s.id: s.ground_truth_type for s in scenarios}
@@ -815,5 +922,5 @@ def run_experiment(runs_per_scenario: int = 10):
 
 
 if __name__ == "__main__":
-    run_experiment(runs_per_scenario=3)
+    run_experiment(runs_per_scenario=10)
 
