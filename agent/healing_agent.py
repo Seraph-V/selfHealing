@@ -538,7 +538,6 @@ def fix_blank_lines(content: str) -> str:
 def heal_scenario(scenario: Scenario, run_index: int) -> list[RunResult]:
     results = []
     branch  = f"experiment/{scenario.id}-run{run_index}"
-    t_start = time.time()
 
     print(f"\n{'─'*60}")
     print(f"Scenario : {scenario.id}  run={run_index}")
@@ -576,12 +575,26 @@ def heal_scenario(scenario: Scenario, run_index: int) -> list[RunResult]:
         print(f"  ✓ Injected: {repo_path}")
 
     # Wait for CI to fail — only accept runs with ID > baseline_run_id (= triggered by injection)
-    conclusion, ci_logs, _ = wait_for_ci(branch, not_before=t_inject, after_run_id=baseline_run_id)
+    conclusion, ci_logs, failure_confirmed_at = wait_for_ci(
+        branch, not_before=t_inject, after_run_id=baseline_run_id
+    )
     if conclusion == "success":
         print("  ⚠  CI passed with broken files — check scenario definition")
         return results
 
     print(f"  ✗ CI failed as expected")
+
+    # MTTR clock starts here, per DORA's Mean Time To Restore definition:
+    # from confirmed failure detection to confirmed recovery. Branch setup,
+    # baseline-run polling, and fault injection above are experimental
+    # scaffolding needed to *produce* the incident, not part of recovering
+    # from it, so they are excluded from the measured duration. Uses
+    # GitHub's own completion timestamp for the failing run (consistent
+    # with how the recovery endpoint is measured below) rather than the
+    # local time.time() at which our poll happened to observe it.
+    t_failure_detected = (
+        failure_confirmed_at.timestamp() if failure_confirmed_at else time.time()
+    )
 
     # Dynamic fault localization from the CI log
     failure_type, affected_files = localize_failure(ci_logs)
@@ -753,7 +766,7 @@ def heal_scenario(scenario: Scenario, run_index: int) -> list[RunResult]:
             # removes up to CI_POLL_SEC seconds of polling jitter and
             # local API round-trip latency from the TTR measurement.
             recovery_end = completed_at.timestamp() if completed_at else time.time()
-            result.time_to_recovery = recovery_end - t_start
+            result.time_to_recovery = recovery_end - t_failure_detected
             print(f"  ✅ Pipeline GREEN after {result.time_to_recovery:.1f}s")
             results.append(result)
             break
