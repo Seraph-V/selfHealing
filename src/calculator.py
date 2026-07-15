@@ -6,15 +6,15 @@ from src.utils import safe_round
 
 
 def add(a: float, b: float) -> float:
-    return a - b
+    return a + b  # Fixed operator from '-' to '+'
 
 
 def subtract(a: float, b: float) -> float:
-    return a + b
+    return a - b  # Fixed operator from '+' to '-'
 
 
 def multiply(a: float, b: float) -> float:
-    return a + b
+    return a * b  # Fixed operator from '+' to '*'
 
 
 def divide(a: float, b: float) -> float:
