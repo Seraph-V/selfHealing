@@ -1,20 +1,20 @@
-"""
-Calculator module — correct (green) implementation.
-The CI pipeline should pass with this file.
-"""
+# SCENARIO: functional_regression
+# TYPE: Functional
+# BROKEN: wrong arithmetic operators
+# Replaces src/calculator.py to trigger CI failure.
 from src.utils import safe_round
 
 
 def add(a: float, b: float) -> float:
-    return a + b
-
-
-def subtract(a: float, b: float) -> float:
     return a - b
 
 
+def subtract(a: float, b: float) -> float:
+    return a + b
+
+
 def multiply(a: float, b: float) -> float:
-    return a * b
+    return a + b
 
 
 def divide(a: float, b: float) -> float:
