@@ -10,6 +10,6 @@ _STORE: dict = {
 
 def get_record(table: str, key: int):
     result = _STORE.get(table, {}).get(key)
-    if result == None:
+    if result is None:
         return None
     return result
