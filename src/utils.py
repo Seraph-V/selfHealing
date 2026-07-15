@@ -1,26 +1,26 @@
-"""
-Utility helpers — correct (green) implementation.
-"""
+# SCENARIO: functional_regression_2
+# TYPE: Functional
+# BROKEN: clamp() returns inverted min/max (lo/hi swapped)
+# Replaces src/utils.py to trigger CI failure.
 import os
 
 import yaml
 
 
-def get_env(key: str, default: str = None) -> str:
+def get_env(key, default=None):
     value = os.environ.get(key, default)
     if value is None:
         return default
     return value
 
 
-def clamp(value: float, min_val: float, max_val: float) -> float:
-    """Clamp value between min and max."""
-    return max(min_val, min(value, max_val))
+def clamp(value, lo, hi):
+    return min(lo, max(value, hi))
 
 
-def safe_round(value: float, digits: int = 2) -> float:
+def safe_round(value, digits=2):
     return round(value, digits)
 
 
-def load_config(text: str) -> dict:
+def load_config(text):
     return yaml.safe_load(text)
