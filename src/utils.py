@@ -9,7 +9,7 @@ import yaml
 
 def get_env(key, default=None):
     value = os.environ.get(key, default)
-    if value == None:
+    if value is None:
         return default
     return value
 
