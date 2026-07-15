@@ -15,7 +15,7 @@ def get_env(key, default=None):
 
 
 def clamp(value, lo, hi):
-    return min(lo, max(value, hi))
+    return max(lo, min(value, hi))
 
 
 def safe_round(value, digits=2):
