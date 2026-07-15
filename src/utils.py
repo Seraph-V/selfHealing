@@ -1,26 +1,27 @@
-"""
-Utility helpers — correct (green) implementation.
-"""
+# SCENARIO: functional_regression_3
+# TYPE: Functional (indirect â€” bug is in a shared helper, not the tested file)
+# BROKEN: safe_round() rounds to one digit fewer than requested (off-by-one)
+# Replaces src/utils.py to trigger CI failure. The failing test imports
+# src.calculator.average(), which internally depends on src.utils.safe_round().
 import os
 
 import yaml
 
 
-def get_env(key: str, default: str = None) -> str:
+def get_env(key, default=None):
     value = os.environ.get(key, default)
     if value is None:
         return default
     return value
 
 
-def clamp(value: float, min_val: float, max_val: float) -> float:
-    """Clamp value between min and max."""
-    return max(min_val, min(value, max_val))
+def clamp(value, lo, hi):
+    return max(lo, min(value, hi))
 
 
-def safe_round(value: float, digits: int = 2) -> float:
-    return round(value, digits)
+def safe_round(value, digits=2):
+    return round(value, digits - 1)
 
 
-def load_config(text: str) -> dict:
+def load_config(text):
     return yaml.safe_load(text)
