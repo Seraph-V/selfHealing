@@ -20,7 +20,7 @@ def clamp(value, lo, hi):
 
 
 def safe_round(value, digits=2):
-    return round(value, digits - 1)
+    return round(value, digits)  # Fixed: removed the off-by-one error by removing 'digits - 1'
 
 
 def load_config(text):
