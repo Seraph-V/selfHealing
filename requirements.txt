@@ -5,7 +5,7 @@
 # This file replaces requirements.txt to trigger the pip install failure.
 # The agent must correct the version pin.
 
-requests==99.99.99
+requests==2.31.0
 pytest==7.4.3
 flake8==6.1.0
 PyYAML==6.0.1
