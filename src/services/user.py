@@ -1,7 +1,7 @@
 # SCENARIO: architectural_regression
 # TYPE: Architectural (circular import)
 # BROKEN: unused circular import between UserService and OrderService
-from src.services.order import OrderService
+
 from src.data import get_record
 
 
