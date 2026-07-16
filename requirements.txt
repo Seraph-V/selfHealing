@@ -1,4 +1,9 @@
+# SCENARIO: configurational_regression_3
+# TYPE: Configurational (missing dependency, not a wrong version pin)
+# BROKEN: PyYAML is missing entirely. pip install succeeds â€” the failure
+# only surfaces later as ModuleNotFoundError when src.utils imports yaml.
+# This file replaces requirements.txt to trigger the failure.
+
 requests==2.31.0
 pytest==7.4.3
 flake8==6.1.0
-PyYAML==6.0.1
