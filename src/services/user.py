@@ -1,4 +1,8 @@
-from src.data import get_record
+# SCENARIO: architectural_regression_2
+# TYPE: Architectural (circular import, functionally load-bearing)
+# BROKEN: get_order_count() wrongly imports OrderService directly instead
+# of reading through the shared src.data layer, causing a circular import.
+from src.services.order import OrderService
 
 
 class UserService:
@@ -10,5 +14,4 @@ class UserService:
         return user.get("name", "Unknown")
 
     def get_order_count(self, user_id: int) -> int:
-        orders = get_record("orders", user_id) or []
-        return len(orders)
+        return len(OrderService().get_orders_for(user_id))
