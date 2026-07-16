@@ -2,7 +2,7 @@
 # TYPE: Architectural (circular import, functionally load-bearing)
 # BROKEN: get_order_summary() wrongly imports UserService directly instead
 # of reading through the shared src.data layer, causing a circular import.
-from src.services.user import UserService
+# from src.services.user import UserService
 
 
 class OrderService:
@@ -10,5 +10,8 @@ class OrderService:
         return ["order_101", "order_102"]
 
     def get_order_summary(self, user_id: int) -> str:
-        name = UserService().get_name(user_id)
+        # name = UserService().get_name(user_id)
+        from src.data import get_record
+        user = get_record("users", user_id)
+        name = user.get("name", "Unknown")
         return f"{name}: {len(self.get_orders_for(user_id))} orders"
