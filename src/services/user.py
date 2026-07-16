@@ -1,7 +1,6 @@
 # SCENARIO: architectural_regression
 # TYPE: Architectural (circular import)
 # BROKEN: unused circular import between UserService and OrderService
-from src.data import get_record
 
 
 class UserService:
@@ -13,5 +12,6 @@ class UserService:
         return user.get("name", "Unknown")
 
     def get_order_count(self, user_id: int) -> int:
+        from src.data import get_record  # Moved the import inside the method to avoid circular dependency
         orders = get_record("orders", user_id) or []
         return len(orders)
