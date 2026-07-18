@@ -1,4 +1,9 @@
-from src.data import get_record
+# SCENARIO: architectural_regression_3
+# TYPE: Architectural (three-file circular import chain, load-bearing)
+# BROKEN: get_order_summary() wrongly imports UserService directly
+# instead of reading through the shared src.data layer, closing a
+# three-file cycle: user -> payment -> order -> user.
+from src.services.user import UserService
 
 
 class OrderService:
@@ -6,6 +11,5 @@ class OrderService:
         return ["order_101", "order_102"]
 
     def get_order_summary(self, user_id: int) -> str:
-        record = get_record("users", user_id) or {}
-        name = record.get("name", "Unknown")
+        name = UserService().get_name(user_id)
         return f"{name}: {len(self.get_orders_for(user_id))} orders"
