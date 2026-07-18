@@ -12,5 +12,5 @@ class PaymentService:
         return record.get("status", "none")
 
     def get_order_count_for_payment(self, user_id: int) -> int:
-        from src.services.order import OrderService
-        return len(OrderService().get_orders_for(user_id))
+        order_service = OrderService()
+        return len(order_service.get_orders_for(user_id))
