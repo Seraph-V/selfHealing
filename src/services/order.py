@@ -11,5 +11,7 @@ class OrderService:
         return ["order_101", "order_102"]
 
     def get_order_summary(self, user_id: int) -> str:
-        name = UserService().get_name(user_id)
-        return f"{name}: {len(self.get_orders_for(user_id))} orders"
+        user_record = get_record("users", user_id) or {}
+        name = user_record.get("name", "Unknown")
+        orders = self.get_orders_for(user_id)
+        return f"{name}: {len(orders)} orders"
