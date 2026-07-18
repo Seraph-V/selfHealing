@@ -19,5 +19,5 @@ class UserService:
         return len(orders)
 
     def get_payment_status(self, user_id: int) -> str:
-        from src.services.payment import PaymentService
-        return PaymentService().get_payment_status(user_id)
+        record = get_record("payments", user_id) or {}
+        return record.get("status", "none")
