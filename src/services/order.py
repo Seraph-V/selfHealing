@@ -3,7 +3,7 @@
 # BROKEN: get_order_summary() wrongly imports UserService directly
 # instead of reading through the shared src.data layer, closing a
 # three-file cycle: user -> payment -> order -> user.
-from src.services.user import UserService
+from src.data import get_record
 
 
 class OrderService:
@@ -11,5 +11,6 @@ class OrderService:
         return ["order_101", "order_102"]
 
     def get_order_summary(self, user_id: int) -> str:
+        from src.services.user import UserService  # Moved import inside the function
         name = UserService().get_name(user_id)
         return f"{name}: {len(self.get_orders_for(user_id))} orders"
