@@ -100,20 +100,57 @@ def delete_branch(branch_name: str):
         pass
 
 
-def get_file_sha(path: str, branch: str) -> Optional[str]:
-    try:
-        return gh("GET", f"/contents/{path}", params={"ref": branch})["sha"]
-    except RuntimeError:
-        return None
+def get_file_sha(path: str, branch: str, retries: int = 2) -> Optional[str]:
+    """
+    Returns the current SHA of a file on the branch, or None if the file
+    genuinely does not exist (404). A non-404 failure (network blip,
+    transient GitHub inconsistency right after branch creation, rate
+    limiting) is retried instead of being treated as "file doesn't exist" —
+    conflating the two previously caused push_file() to omit the required
+    'sha' for a file that does exist, which GitHub rejects with a 422.
+    """
+    last_error: Optional[Exception] = None
+    for attempt in range(retries + 1):
+        try:
+            return gh("GET", f"/contents/{path}", params={"ref": branch})["sha"]
+        except RuntimeError as e:
+            if "→ 404:" in str(e):
+                return None
+            last_error = e
+            if attempt < retries:
+                time.sleep(2)
+    raise RuntimeError(
+        f"get_file_sha: persistent failure for '{path}' after "
+        f"{retries + 1} attempts: {last_error}"
+    )
 
 
-def push_file(repo_path: str, content: str, message: str, branch: str):
+def push_file(repo_path: str, content: str, message: str, branch: str, retries: int = 2):
+    """
+    Pushes a file to the branch. Retries the full get-SHA-then-PUT sequence
+    on failure (not just the PUT) so a stale or missing SHA — e.g. from a
+    transient error on the lookup, or a race with another writer — is
+    re-fetched fresh on the next attempt instead of repeating the same
+    failing payload.
+    """
     encoded = base64.b64encode(content.encode()).decode()
-    file_sha = get_file_sha(repo_path, branch)
-    payload = {"message": message, "content": encoded, "branch": branch}
-    if file_sha:
-        payload["sha"] = file_sha
-    gh("PUT", f"/contents/{repo_path}", json=payload)
+    last_error: Optional[Exception] = None
+    for attempt in range(retries + 1):
+        try:
+            file_sha = get_file_sha(repo_path, branch)
+            payload = {"message": message, "content": encoded, "branch": branch}
+            if file_sha:
+                payload["sha"] = file_sha
+            gh("PUT", f"/contents/{repo_path}", json=payload)
+            return
+        except RuntimeError as e:
+            last_error = e
+            if attempt < retries:
+                time.sleep(2)
+    raise RuntimeError(
+        f"push_file: persistent failure for '{repo_path}' after "
+        f"{retries + 1} attempts: {last_error}"
+    )
 
 
 def get_file_content(repo_path: str, branch: str) -> str:
@@ -865,6 +902,23 @@ def get_scenarios() -> list[Scenario]:
             context_files=["src/data.py"],
             ground_truth_type="architectural",
         ),
+        Scenario(
+            id="architectural_regression_3",
+            description=(
+                "Three-file circular import chain (user -> payment -> order -> "
+                "user), every edge functionally load-bearing — extends "
+                "architectural_regression_2 from a two-file to a three-file "
+                "cycle; the correct fix routes all three edges through the "
+                "shared src.data layer instead."
+            ),
+            broken_files={
+                "src/services/user.py":    f"{base}/architectural_regression_3_user.py",
+                "src/services/order.py":   f"{base}/architectural_regression_3_order.py",
+                "src/services/payment.py": f"{base}/architectural_regression_3_payment.py",
+            },
+            context_files=["src/data.py"],
+            ground_truth_type="architectural",
+        ),
     ]
 
 
@@ -928,5 +982,5 @@ def run_experiment(runs_per_scenario: int = 10):
 
 
 if __name__ == "__main__":
-    run_experiment(runs_per_scenario=10)
+    run_experiment(runs_per_scenario=30)
 

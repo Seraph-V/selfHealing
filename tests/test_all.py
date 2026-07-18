@@ -96,6 +96,9 @@ class TestArchitectural:
     def test_order_service_importable(self):
         from src.services.order import OrderService  # noqa: F401
 
+    def test_payment_service_importable(self):
+        from src.services.payment import PaymentService  # noqa: F401
+
     def test_both_services_importable_together(self):
         """This is the key test — fails with circular imports."""
         from src.services.user import UserService
@@ -104,6 +107,18 @@ class TestArchitectural:
         o = OrderService()
         assert u.get_name(1) == "Alice"
         assert o.get_orders_for(1) == ["order_101", "order_102"]
+
+    def test_all_three_services_importable_together(self):
+        """Fails with a circular import anywhere in the 3-file cycle."""
+        from src.services.user import UserService
+        from src.services.order import OrderService
+        from src.services.payment import PaymentService
+        u = UserService()
+        o = OrderService()
+        p = PaymentService()
+        assert u.get_name(1) == "Alice"
+        assert o.get_orders_for(1) == ["order_101", "order_102"]
+        assert p.get_payment_status(1) == "paid"
 
     def test_user_service_order_count(self):
         """Requires cross-domain data (order count) via src.data, not OrderService."""
@@ -118,26 +133,42 @@ class TestArchitectural:
         assert "Alice" in summary
         assert "2" in summary
 
+    def test_user_service_payment_status(self):
+        """Requires cross-domain data (payment status) via src.data, not PaymentService."""
+        from src.services.user import UserService
+        assert UserService().get_payment_status(1) == "paid"
+        assert UserService().get_payment_status(2) == "pending"
+
+    def test_payment_service_order_count(self):
+        """Requires cross-domain data (order count) via src.data, not OrderService."""
+        from src.services.payment import PaymentService
+        assert PaymentService().get_order_count_for_payment(1) == 2
+        assert PaymentService().get_order_count_for_payment(2) == 0
+
     def test_no_cross_service_dependency(self):
         """Verify services only depend on src.data, not each other."""
         import importlib
         import sys
+
+        service_names = ["user", "order", "payment"]
 
         # Clear cached modules to get a fresh import
         for mod in list(sys.modules.keys()):
             if "src.services" in mod:
                 del sys.modules[mod]
 
-        user_mod = importlib.import_module("src.services.user")
-        order_mod = importlib.import_module("src.services.order")
+        sources = {}
+        for name in service_names:
+            mod = importlib.import_module(f"src.services.{name}")
+            sources[name] = open(mod.__file__).read()
 
-        user_src = open(user_mod.__file__).read()
-        order_src = open(order_mod.__file__).read()
-
-        assert "from src.services.order" not in user_src, \
-            "UserService must not import OrderService (circular dependency)"
-        assert "from src.services.user" not in order_src, \
-            "OrderService must not import UserService (circular dependency)"
+        for name, src in sources.items():
+            for other in service_names:
+                if other != name and f"from src.services.{other}" in src:
+                    raise AssertionError(
+                        f"{name}.py must not import {other}.py "
+                        "(circular dependency)"
+                    )
 
 
 # ── Utility Tests ─────────────────────────────────────────────────────────────
