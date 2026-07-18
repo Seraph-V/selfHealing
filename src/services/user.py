@@ -3,7 +3,6 @@
 # BROKEN: get_payment_status() wrongly imports PaymentService directly
 # instead of reading through the shared src.data layer, closing a
 # three-file cycle: user -> payment -> order -> user.
-from src.services.payment import PaymentService
 from src.data import get_record
 
 
@@ -20,4 +19,5 @@ class UserService:
         return len(orders)
 
     def get_payment_status(self, user_id: int) -> str:
+        from src.services.payment import PaymentService
         return PaymentService().get_payment_status(user_id)
