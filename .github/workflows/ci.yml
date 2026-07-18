@@ -79,7 +79,9 @@ jobs:
           python -c "
           from src.services.user import UserService
           from src.services.order import OrderService
+          from src.services.payment import PaymentService
           print('✅ No circular imports detected')
           print(f'   UserService: {UserService}')
           print(f'   OrderService: {OrderService}')
+          print(f'   PaymentService: {PaymentService}')
           "
