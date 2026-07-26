@@ -1,11 +1,6 @@
 """
-Self-Healing CI Agent — v7 (fully autonomous)
+Self-Healing CI Agent — v7
 Bachelor Thesis — Valentin Jurke
-
-v7 changes:
-  - Scenarios have no predefined failure_type; agent classifies from CI logs only
-  - Files to fix are scraped from CI logs (regex + LLM fallback); not hardcoded
-  - ground_truth_type kept in Scenario for evaluation metrics only, not used by agent
 """
 
 import base64
@@ -101,14 +96,6 @@ def delete_branch(branch_name: str):
 
 
 def get_file_sha(path: str, branch: str, retries: int = 2) -> Optional[str]:
-    """
-    Returns the current SHA of a file on the branch, or None if the file
-    genuinely does not exist (404). A non-404 failure (network blip,
-    transient GitHub inconsistency right after branch creation, rate
-    limiting) is retried instead of being treated as "file doesn't exist" —
-    conflating the two previously caused push_file() to omit the required
-    'sha' for a file that does exist, which GitHub rejects with a 422.
-    """
     last_error: Optional[Exception] = None
     for attempt in range(retries + 1):
         try:
@@ -126,13 +113,6 @@ def get_file_sha(path: str, branch: str, retries: int = 2) -> Optional[str]:
 
 
 def push_file(repo_path: str, content: str, message: str, branch: str, retries: int = 2):
-    """
-    Pushes a file to the branch. Retries the full get-SHA-then-PUT sequence
-    on failure (not just the PUT) so a stale or missing SHA — e.g. from a
-    transient error on the lookup, or a race with another writer — is
-    re-fetched fresh on the next attempt instead of repeating the same
-    failing payload.
-    """
     encoded = base64.b64encode(content.encode()).decode()
     last_error: Optional[Exception] = None
     for attempt in range(retries + 1):
@@ -171,13 +151,6 @@ def utc_now() -> datetime:
 def wait_for_ci(branch: str, after_run_id: Optional[int] = None,
                 not_before: Optional[datetime] = None
                 ) -> tuple[str, str, Optional[datetime]]:
-    """
-    Waits for a completed CI run on the branch.
-    not_before: Only accept runs that started after this UTC timestamp.
-    after_run_id: Fallback filter by run ID (legacy support).
-
-    Returns (conclusion, ci_logs, completed_at).
-    """
     print(f"  ⏳ Waiting for CI on '{branch}'...", end="", flush=True)
     deadline = time.time() + CI_TIMEOUT
 
@@ -340,10 +313,8 @@ def localize_failure(ci_log: str) -> tuple[str, list[str]]:
         "FAILED", "AssertionError", "assert"
     ]):
         failure_type = "functional"
-        # --tb=long shows function bodies: "from src.calculator import add"
         for m in re.findall(r'from (src(?:\.\w+)+) import', ci_log):
             files.add(m.replace(".", "/") + ".py")
-        # Fallback naming convention: FAILED tests/test_X.py → src/X.py
         if not files:
             for m in re.findall(r'FAILED tests/test_(\w+)\.py', ci_log):
                 files.add(f"src/{m}.py")
@@ -356,14 +327,6 @@ def localize_functional_source(
     known_files: list[str],
     known_contents: dict[str, str],
 ) -> list[str]:
-    """
-    LLM call for functional-regression file localization. Always invoked
-    (in addition to the deterministic regex match in localize_failure()),
-    so the LLM can confirm or extend the file set — e.g. propose a shared
-    helper module that the regex-only extraction cannot see, since it only
-    matches the import statement literally present in the failing test's
-    own source code, not the internal call graph of the file it imports.
-    """
     context_block = "\n\n".join(
         f"### {path}\n```\n{content}\n```"
         for path, content in known_contents.items()
@@ -521,7 +484,7 @@ def parse_patch(raw: str) -> Optional[dict]:
             "patches":  patches,
         }
 
-    # Fallback: standard JSON parse (catches cases where the model ignores format instructions)
+    # Fallback: standard JSON parse
     clean = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
     try:
         return json.loads(clean)
@@ -580,14 +543,8 @@ def heal_scenario(scenario: Scenario, run_index: int) -> list[RunResult]:
     delete_branch(branch)   # remove stale branch from any previous run
     create_branch(branch)
 
-    # Wait for the branch-creation CI run (healthy code → would pass) to be
-    # registered in GitHub Actions. We record its ID as a baseline so that
-    # wait_for_ci() can use after_run_id to guarantee it only accepts the run
-    # triggered by our broken-file injection — not the healthy branch-creation run.
-    # Without this, a race exists: GitHub schedules the clean run asynchronously
-    # and its created_at may land after t_inject, bypassing the not_before filter.
     baseline_run_id = pre_delete_id
-    for _ in range(12):  # poll up to 60 s (12 × 5 s)
+    for _ in range(12):
         time.sleep(5)
         rid = get_latest_run_id(branch)
         if rid and rid > pre_delete_id:
@@ -604,7 +561,6 @@ def heal_scenario(scenario: Scenario, run_index: int) -> list[RunResult]:
                   f"[experiment] inject regression: {scenario.id}", branch)
         print(f"  ✓ Injected: {repo_path}")
 
-    # Wait for CI to fail — only accept runs with ID > baseline_run_id (= triggered by injection)
     conclusion, ci_logs, failure_confirmed_at = wait_for_ci(
         branch, not_before=t_inject, after_run_id=baseline_run_id
     )
@@ -614,14 +570,6 @@ def heal_scenario(scenario: Scenario, run_index: int) -> list[RunResult]:
 
     print(f"  ✗ CI failed as expected")
 
-    # MTTR clock starts here, per DORA's Mean Time To Restore definition:
-    # from confirmed failure detection to confirmed recovery. Branch setup,
-    # baseline-run polling, and fault injection above are experimental
-    # scaffolding needed to *produce* the incident, not part of recovering
-    # from it, so they are excluded from the measured duration. Uses
-    # GitHub's own completion timestamp for the failing run (consistent
-    # with how the recovery endpoint is measured below) rather than the
-    # local time.time() at which our poll happened to observe it.
     t_failure_detected = (
         failure_confirmed_at.timestamp() if failure_confirmed_at else time.time()
     )
@@ -636,10 +584,7 @@ def heal_scenario(scenario: Scenario, run_index: int) -> list[RunResult]:
     print(f"  → Affected files: {affected_files}")
 
     # Functional special case: first extend the candidate set deterministically,
-    # then confirm/extend it via LLM. The regex in localize_failure() only sees
-    # the import statement literally present in the test code itself, not the
-    # internal call graph of the file it imports — a bug in an imported helper
-    # file (e.g. utils.py, imported by calculator.py) would otherwise be invisible.
+    # then confirm/extend it via LLM.
     if failure_type == "functional":
         candidates = []
         for tf in affected_files:
@@ -654,8 +599,6 @@ def heal_scenario(scenario: Scenario, run_index: int) -> list[RunResult]:
             except RuntimeError:
                 pass
 
-        # Deterministic extension: any src/ module imported by an already-known
-        # file is automatically added as a candidate — does not rely on LLM inference.
         for m in re.findall(r'from (src(?:\.\w+)+) import',
                              "\n".join(known_contents.values())):
             extra_path = m.replace(".", "/") + ".py"
@@ -670,15 +613,12 @@ def heal_scenario(scenario: Scenario, run_index: int) -> list[RunResult]:
               end="", flush=True)
         llm_files = localize_functional_source(ci_logs, candidates, known_contents)
         print(f" {llm_files}")
-        # Union instead of replacement: the LLM call can only add candidates,
-        # never silently discard one that was found deterministically.
         affected_files = list(dict.fromkeys(candidates + llm_files))
 
     if not affected_files:
         print("  ⚠  No affected files identified — skipping")
         return results
 
-    # Load file contents from the branch
     broken_contents: dict[str, str] = {}
     for repo_path in affected_files:
         try:
@@ -730,19 +670,17 @@ def heal_scenario(scenario: Scenario, run_index: int) -> list[RunResult]:
 
         print(f"  → {patch_data.get('analysis', 'N/A')}")
 
-        # Apply patches — full file replacement
+        # Apply patches(full file replacement)
         known        = set(affected_files)
         diff_lines   = []
         apply_ok     = True
-        t_last_push  = utc_now()  # updated just before each push; final value = last push time
+        t_last_push  = utc_now() 
         patches_list = patch_data.get("patches", [])
         for patch in patches_list:
             repo_path     = patch.get("filename")
             fixed_content = patch.get("fixed_content", "")
 
             if repo_path not in known:
-                # Normalize runner absolute paths by matching known file suffixes
-                # e.g. "home/runner/work/repo/repo/requirements.txt" → "requirements.txt"
                 normalized = next(
                     (k for k in known if repo_path == k or repo_path.endswith('/' + k)),
                     None,
@@ -767,8 +705,6 @@ def heal_scenario(scenario: Scenario, run_index: int) -> list[RunResult]:
             if not fixed_content.endswith('\n'):
                 fixed_content += '\n'
 
-            # Timestamp just before the push so wait_for_ci skips CI runs from
-            # earlier pushes (intermediate states) in multi-file scenarios.
             t_last_push = utc_now()
             push_file(
                 repo_path, fixed_content,
@@ -791,10 +727,6 @@ def heal_scenario(scenario: Scenario, run_index: int) -> list[RunResult]:
         result.ci_green = conclusion == "success"
 
         if result.ci_green:
-            # Prefer GitHub's own completion timestamp over the local
-            # time.time() at which our poll happened to observe it —
-            # removes up to CI_POLL_SEC seconds of polling jitter and
-            # local API round-trip latency from the TTR measurement.
             recovery_end = completed_at.timestamp() if completed_at else time.time()
             result.time_to_recovery = recovery_end - t_failure_detected
             print(f"  ✅ Pipeline GREEN after {result.time_to_recovery:.1f}s")
@@ -811,7 +743,7 @@ def heal_scenario(scenario: Scenario, run_index: int) -> list[RunResult]:
 
 def get_scenarios() -> list[Scenario]:
     base = "scenarios"
-
+    '''
     return [
         Scenario(
             id="functional_regression",
@@ -902,6 +834,8 @@ def get_scenarios() -> list[Scenario]:
             context_files=["src/data.py"],
             ground_truth_type="architectural",
         ),
+        '''
+    return[
         Scenario(
             id="architectural_regression_3",
             description=(

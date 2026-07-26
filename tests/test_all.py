@@ -1,22 +1,12 @@
-"""
-Test suite for the self-healing pipeline thesis.
 
-These tests define what "green" looks like for each scenario category:
-  - test_functional_*      → Functional regression scenarios
-  - test_syntactic_*       → Caught by flake8 in the lint job (not pytest)
-  - test_configurational_* → Dependency / import availability
-  - test_architectural_*   → Circular import / structural integrity
-"""
+#Test suite for the self-healing pipeline thesis.
+
 import pytest
 
 
 # ── Functional Regression Tests ───────────────────────────────────────────────
 
 class TestFunctional:
-    """
-    These tests will FAIL when src/calculator.py has wrong operators
-    and PASS after the agent applies the correct fix.
-    """
 
     def test_add_positive(self):
         from src.calculator import add
@@ -64,11 +54,6 @@ class TestFunctional:
 # ── Configurational Regression Tests ─────────────────────────────────────────
 
 class TestConfigurational:
-    """
-    These tests verify that required packages are importable.
-    They FAIL if requirements.txt pins a nonexistent version and
-    pip install fails during the CI setup step.
-    """
 
     def test_requests_importable(self):
         import requests  # noqa: F401
@@ -85,10 +70,6 @@ class TestConfigurational:
 # ── Architectural Regression Tests ────────────────────────────────────────────
 
 class TestArchitectural:
-    """
-    These tests will FAIL if circular imports exist between services
-    and PASS once the dependency structure is corrected.
-    """
 
     def test_user_service_importable(self):
         from src.services.user import UserService  # noqa: F401
