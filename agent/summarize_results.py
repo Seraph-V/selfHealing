@@ -1,24 +1,3 @@
-"""
-Summarizes a results/experiment_*.json file into the FSR/VPR/MTTR table.
-
-run_experiment() only prints this summary to the console and never saves it,
-so it has to be recomputed from the raw per-attempt records whenever the
-console output wasn't captured.
-
-MTTR (Mean Time To Recovery, per DORA) is the average of each attempt's
-time_to_recovery across a scenario's runs — see heal_scenario()'s
-t_failure_detected for how the per-attempt value itself is measured
-(from confirmed failure detection to confirmed recovery).
-
-HR (Hallucination Rate) is intentionally not computed here — dropped from
-the final metric set with Dr. Abdullah's approval (2026-07-11); see the
-"Advisor Decisions" note in CLAUDE.md for the required justification text.
-
-Usage:
-    python agent/summarize_results.py [path/to/experiment_*.json]
-    (defaults to the most recently modified file in results/)
-"""
-
 import glob
 import json
 import os

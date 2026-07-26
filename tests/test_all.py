@@ -1,6 +1,4 @@
-
-#Test suite for the self-healing pipeline thesis.
-
+# Test suite for the self-healing pipeline thesis.
 import pytest
 
 
