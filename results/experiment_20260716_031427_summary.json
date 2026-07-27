@@ -1,0 +1,122 @@
+[
+  {
+    "scenario_id": "architectural_regression",
+    "runs": 30,
+    "attempts": 34,
+    "applied": 34,
+    "green": 28,
+    "fsr": 0.9333333333333333,
+    "vpr": 1.0,
+    "mttr": 42.642857142857146
+  },
+  {
+    "scenario_id": "architectural_regression_2",
+    "runs": 30,
+    "attempts": 44,
+    "applied": 44,
+    "green": 24,
+    "fsr": 0.8,
+    "vpr": 1.0,
+    "mttr": 52.0
+  },
+  {
+    "scenario_id": "architectural_regression_3",
+    "runs": 30,
+    "attempts": 52,
+    "applied": 52,
+    "green": 26,
+    "fsr": 0.8666666666666667,
+    "vpr": 1.0,
+    "mttr": 73.23076923076923
+  },
+  {
+    "scenario_id": "configurational_regression",
+    "runs": 30,
+    "attempts": 30,
+    "applied": 30,
+    "green": 30,
+    "fsr": 1.0,
+    "vpr": 1.0,
+    "mttr": 43.43333333333333
+  },
+  {
+    "scenario_id": "configurational_regression_2",
+    "runs": 30,
+    "attempts": 31,
+    "applied": 31,
+    "green": 30,
+    "fsr": 1.0,
+    "vpr": 1.0,
+    "mttr": 44.733333333333334
+  },
+  {
+    "scenario_id": "configurational_regression_3",
+    "runs": 30,
+    "attempts": 30,
+    "applied": 30,
+    "green": 30,
+    "fsr": 1.0,
+    "vpr": 1.0,
+    "mttr": 41.2
+  },
+  {
+    "scenario_id": "functional_regression",
+    "runs": 30,
+    "attempts": 30,
+    "applied": 30,
+    "green": 30,
+    "fsr": 1.0,
+    "vpr": 1.0,
+    "mttr": 51.9
+  },
+  {
+    "scenario_id": "functional_regression_2",
+    "runs": 30,
+    "attempts": 30,
+    "applied": 30,
+    "green": 30,
+    "fsr": 1.0,
+    "vpr": 1.0,
+    "mttr": 43.63333333333333
+  },
+  {
+    "scenario_id": "functional_regression_3",
+    "runs": 30,
+    "attempts": 40,
+    "applied": 40,
+    "green": 25,
+    "fsr": 0.8333333333333334,
+    "vpr": 1.0,
+    "mttr": 46.68
+  },
+  {
+    "scenario_id": "syntactic_regression",
+    "runs": 30,
+    "attempts": 30,
+    "applied": 30,
+    "green": 30,
+    "fsr": 1.0,
+    "vpr": 1.0,
+    "mttr": 39.333333333333336
+  },
+  {
+    "scenario_id": "syntactic_regression_2",
+    "runs": 30,
+    "attempts": 30,
+    "applied": 30,
+    "green": 30,
+    "fsr": 1.0,
+    "vpr": 1.0,
+    "mttr": 39.4
+  },
+  {
+    "scenario_id": "syntactic_regression_3",
+    "runs": 30,
+    "attempts": 30,
+    "applied": 30,
+    "green": 30,
+    "fsr": 1.0,
+    "vpr": 1.0,
+    "mttr": 38.333333333333336
+  }
+]
